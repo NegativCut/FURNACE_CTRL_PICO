@@ -22,7 +22,8 @@ volatile bool swPressed = false;
 #define textColour TFT_WHITE
 #define textSize 3
 #define menuTextSize 2
-#define NUM_OPTIONS 3
+#define NUM_OPTIONS 4
+#define NUM_SETTINGS 3
 #define DRAW_INTERVAL 250
 
 #include "Adafruit_MAX31855.h"
@@ -55,6 +56,20 @@ bool readProfileEnabled = false;
 bool sdCardPresent = false;
 bool sdInitialized = false;
 int selectedOption = 0;
+
+// Settings
+float tcSmoothing = 0.3f;
+float tcOffset = 0.0f;
+float smoothedTempC = 0;
+bool smoothedSeeded = false;
+bool inSettings = false;
+int settingsItem = 0;
+bool settingsEditing = false;
+float lastTcSmoothing = -1;
+float lastTcOffset = -99;
+int lastSettingsItem = -1;
+bool lastSettingsEditing = false;
+bool lastInSettings = false;
 
 // Profile steps — single-column target temperatures
 struct RampStep {
@@ -119,8 +134,11 @@ char lastTcStr[10];
 void readProfile();
 void loadLearnedData();
 void saveLearnedData();
+void loadSettings();
+void saveSettings();
 float tickLearnMode();
 void drawMenu(float setpointTemp);
+void drawSettings();
 void stopAllOutputs();
 void freeProfile();
 void freeLearned();
@@ -158,6 +176,13 @@ void setup() {
 
   delay(500);
 
+  // Seed smoothed temp with first valid reading
+  float initTemp = thermocouple.readCelsius();
+  if (!isnan(initTemp)) {
+    smoothedTempC = initTemp + tcOffset;
+    smoothedSeeded = true;
+  }
+
   // Init last values to force full initial draw
   strcpy(lastTcStr, "~");
   lastSelectedOption = -1;
@@ -187,26 +212,55 @@ void loop() {
   digitalWrite(ledpin, LOW);
   readPicoT();
 
-  currentTempC = thermocouple.readCelsius();
+  float rawTempC = thermocouple.readCelsius();
   currentInternalTemp = thermocouple.readInternal();
-  if (isnan(currentTempC)) {
+  if (isnan(rawTempC)) {
     uint8_t fault = thermocouple.readError();
     if (fault & MAX31855_FAULT_OPEN) strcpy(tc_str, "OPEN");
     else if (fault & MAX31855_FAULT_SHORT_GND) strcpy(tc_str, "GND");
     else if (fault & MAX31855_FAULT_SHORT_VCC) strcpy(tc_str, "VCC");
     else strcpy(tc_str, "ERR");
+    currentTempC = rawTempC;
   } else {
+    float adjusted = rawTempC + tcOffset;
+    if (!smoothedSeeded) {
+      smoothedTempC = adjusted;
+      smoothedSeeded = true;
+    } else {
+      smoothedTempC = tcSmoothing * adjusted + (1.0f - tcSmoothing) * smoothedTempC;
+    }
+    currentTempC = smoothedTempC;
     dtostrf(currentTempC, 4, 1, tc_str);
   }
 
   pio_sm_exec_wait_blocking(pio, sm, pio_encode_in(pio_x, 32));
   int32_t raw = (int32_t)pio_sm_get_blocking(pio, sm);
   int32_t delta = raw - last_encoder_value;
-  if (delta != 0) {
-    selectedOption = ((selectedOption + delta) % NUM_OPTIONS + NUM_OPTIONS) % NUM_OPTIONS;
-  }
   last_encoder_value = raw;
   encoder_value = raw;
+
+  // Encoder routing: settings sub-menu vs main menu
+  if (delta != 0) {
+    if (inSettings) {
+      if (settingsEditing) {
+        // Adjust the selected setting value
+        if (settingsItem == 0) {
+          tcSmoothing += delta * 0.1f;
+          if (tcSmoothing < 0.1f) tcSmoothing = 0.1f;
+          if (tcSmoothing > 1.0f) tcSmoothing = 1.0f;
+        } else if (settingsItem == 1) {
+          tcOffset += delta * 0.1f;
+          if (tcOffset < -10.0f) tcOffset = -10.0f;
+          if (tcOffset > 10.0f) tcOffset = 10.0f;
+        }
+      } else {
+        // Navigate settings items
+        settingsItem = ((settingsItem + delta) % NUM_SETTINGS + NUM_SETTINGS) % NUM_SETTINGS;
+      }
+    } else {
+      selectedOption = ((selectedOption + delta) % NUM_OPTIONS + NUM_OPTIONS) % NUM_OPTIONS;
+    }
+  }
 
   checkSDCard();
 
@@ -216,95 +270,129 @@ void loop() {
   interrupts();
 
   if (pressed) {
-    if (selectedOption == 0) {
-      // Toggle logging
-      loggingEnabled = !loggingEnabled;
-      Serial.print("Logging: ");
-      Serial.println(loggingEnabled ? "ON" : "OFF");
-
-    } else if (selectedOption == 1) {
-      // Toggle profile run
-      readProfileEnabled = !readProfileEnabled;
-      Serial.print("Profile: ");
-      Serial.println(readProfileEnabled ? "ON" : "OFF");
-      if (readProfileEnabled) {
-        // Deactivate learn mode
-        learnModeEnabled = false;
-        learnModeActive = false;
-        learnPhase = LEARN_IDLE;
-        if (sdCardPresent) {
-          readProfile();
-          loadLearnedData();
-          if (numSteps > 0) {
-            currentStep = 0;
-            startTemp = isnan(currentTempC) ? 25.0f : currentTempC;
-            rampActive = true;
-            rampHeating = true;
-          }
-        }
+    if (inSettings) {
+      // Settings sub-menu button handling
+      if (settingsItem == 2) {
+        // "Back" — exit settings, save
+        inSettings = false;
+        settingsEditing = false;
+        if (sdCardPresent && sdInitialized) saveSettings();
+        tft.fillScreen(TFT_BLACK);
+        // Force full main menu redraw
+        lastSelectedOption = -1;
+        lastSdPresent = !sdCardPresent;
+        lastLogging = !loggingEnabled;
+        lastProfile = !readProfileEnabled;
+        lastLearnMode = !learnModeEnabled;
+        lastRampActive = !rampActive;
+        lastLearnActive = !learnModeActive;
+        lastCurrentStep = -1;
+        strcpy(lastTcStr, "~");
+        lastAverage = average - 1;
+        lastInternalTemp = currentInternalTemp - 1;
+        lastEncoderVal = encoder_value - 1;
       } else {
-        rampActive = false;
-        freeProfile();
-        stopAllOutputs();
+        // Toggle edit mode for smoothing or offset
+        settingsEditing = !settingsEditing;
       }
 
-    } else if (selectedOption == 2) {
-      // Toggle learn mode
-      learnModeEnabled = !learnModeEnabled;
-      Serial.print("Learn: ");
-      Serial.println(learnModeEnabled ? "ON" : "OFF");
-      if (learnModeEnabled) {
-        // Deactivate profile run
-        readProfileEnabled = false;
-        rampActive = false;
-        if (sdCardPresent) {
-          readProfile();
-          if (numSteps > 0) {
-            // Load previous learned data for early cutoff
-            loadLearnedData();
-            // Allocate learned array for this run
-            LearnedStep* newLearned = (LearnedStep*)malloc(numSteps * sizeof(LearnedStep));
-            if (newLearned) {
-              memset(newLearned, 0, numSteps * sizeof(LearnedStep));
-              int copyCount = (numLearned < numSteps) ? numLearned : numSteps;
-              for (int i = 0; i < copyCount; i++) {
-                newLearned[i] = learned[i];
-              }
-              free(learned);
-              learned = newLearned;
-              numLearned = copyCount;
+    } else {
+      // Main menu button handling
+      if (selectedOption == 0) {
+        // Toggle logging
+        loggingEnabled = !loggingEnabled;
+        Serial.print("Logging: ");
+        Serial.println(loggingEnabled ? "ON" : "OFF");
 
+      } else if (selectedOption == 1) {
+        // Toggle profile run
+        readProfileEnabled = !readProfileEnabled;
+        Serial.print("Profile: ");
+        Serial.println(readProfileEnabled ? "ON" : "OFF");
+        if (readProfileEnabled) {
+          learnModeEnabled = false;
+          learnModeActive = false;
+          learnPhase = LEARN_IDLE;
+          if (sdCardPresent) {
+            readProfile();
+            loadLearnedData();
+            if (numSteps > 0) {
               currentStep = 0;
               startTemp = isnan(currentTempC) ? 25.0f : currentTempC;
-              learnStepStartTime = millis();
-              learnPeakTemp = 0;
-              learnTargetCrossTime = 0;
-              learnRateAtCutoff = 0;
-              learnPrevTemp = isnan(currentTempC) ? 25.0f : currentTempC;
-              learnPrevTime = millis();
-              learnModeActive = true;
+              rampActive = true;
+              rampHeating = true;
+            }
+          }
+        } else {
+          rampActive = false;
+          freeProfile();
+          stopAllOutputs();
+        }
 
-              float target = steps[0].targetTemp;
-              if (target < learnPrevTemp) {
-                learnPhase = LEARN_COOLING;
+      } else if (selectedOption == 2) {
+        // Toggle learn mode
+        learnModeEnabled = !learnModeEnabled;
+        Serial.print("Learn: ");
+        Serial.println(learnModeEnabled ? "ON" : "OFF");
+        if (learnModeEnabled) {
+          readProfileEnabled = false;
+          rampActive = false;
+          if (sdCardPresent) {
+            readProfile();
+            if (numSteps > 0) {
+              loadLearnedData();
+              LearnedStep* newLearned = (LearnedStep*)malloc(numSteps * sizeof(LearnedStep));
+              if (newLearned) {
+                memset(newLearned, 0, numSteps * sizeof(LearnedStep));
+                int copyCount = (numLearned < numSteps) ? numLearned : numSteps;
+                for (int i = 0; i < copyCount; i++) {
+                  newLearned[i] = learned[i];
+                }
+                free(learned);
+                learned = newLearned;
+                numLearned = copyCount;
+
+                currentStep = 0;
+                startTemp = isnan(currentTempC) ? 25.0f : currentTempC;
+                learnStepStartTime = millis();
+                learnPeakTemp = 0;
+                learnTargetCrossTime = 0;
+                learnRateAtCutoff = 0;
+                learnPrevTemp = isnan(currentTempC) ? 25.0f : currentTempC;
+                learnPrevTime = millis();
+                learnModeActive = true;
+
+                float target = steps[0].targetTemp;
+                learnPhase = (target < learnPrevTemp) ? LEARN_COOLING : LEARN_HEATING;
+                Serial.print("Learn mode started: ");
+                Serial.print(numSteps);
+                Serial.println(" steps");
               } else {
-                learnPhase = LEARN_HEATING;
+                Serial.println("Failed to allocate learned array");
+                learnModeEnabled = false;
               }
-              Serial.print("Learn mode started: ");
-              Serial.print(numSteps);
-              Serial.println(" steps");
             } else {
-              Serial.println("Failed to allocate learned array");
               learnModeEnabled = false;
             }
-          } else {
-            learnModeEnabled = false;
           }
+        } else {
+          learnModeActive = false;
+          learnPhase = LEARN_IDLE;
+          stopAllOutputs();
         }
-      } else {
-        learnModeActive = false;
-        learnPhase = LEARN_IDLE;
-        stopAllOutputs();
+
+      } else if (selectedOption == 3) {
+        // Enter settings
+        inSettings = true;
+        settingsItem = 0;
+        settingsEditing = false;
+        tft.fillScreen(TFT_BLACK);
+        // Force full settings draw
+        lastTcSmoothing = -1;
+        lastTcOffset = -99;
+        lastSettingsItem = -1;
+        lastSettingsEditing = false;
+        lastInSettings = false;
       }
     }
   }
@@ -315,7 +403,6 @@ void loop() {
     float target = steps[currentStep].targetTemp;
     setpointTemp = target;
 
-    // Find learned early cutoff for this step
     float cutoff = target;
     if (learnedDataLoaded && currentStep < numLearned &&
         learned[currentStep].targetTemp == target &&
@@ -324,7 +411,6 @@ void loop() {
     }
 
     if (target >= currentTempC) {
-      // Heating step
       if (rampHeating && currentTempC < cutoff) {
         digitalWrite(esc, HIGH);
         digitalWrite(relay, HIGH);
@@ -333,7 +419,6 @@ void loop() {
         digitalWrite(relay, LOW);
         digitalWrite(esc, HIGH);
         if (currentTempC <= target + 1.0f && currentTempC >= target - 1.0f) {
-          // Settled — advance
           currentStep++;
           rampHeating = true;
           if (currentStep >= numSteps) {
@@ -343,7 +428,6 @@ void loop() {
         }
       }
     } else {
-      // Cooling step
       digitalWrite(relay, LOW);
       digitalWrite(esc, LOW);
       if (currentTempC <= target + 1.0f) {
@@ -362,38 +446,56 @@ void loop() {
     setpointTemp = tickLearnMode();
   }
 
-  // Draw if needed
-  bool needsRedraw = (millis() - lastDrawTime >= DRAW_INTERVAL) ||
-                     (fabs(currentTempC - lastTempC) > 1.0) ||
-                     (abs(average - lastAverage) > 5) ||
-                     (encoder_value != lastEncoderVal) ||
-                     (selectedOption != lastSelectedOption) ||
-                     (loggingEnabled != lastLogging) ||
-                     (readProfileEnabled != lastProfile) ||
-                     (learnModeEnabled != lastLearnMode) ||
-                     (learnModeActive != lastLearnActive) ||
-                     (learnPhase != lastLearnPhase) ||
-                     (sdCardPresent != lastSdPresent) ||
-                     (rampActive != lastRampActive) ||
-                     (currentStep != lastCurrentStep) ||
-                     (abs(currentInternalTemp - lastInternalTemp) > 2);
+  // Draw
+  if (inSettings) {
+    bool settingsChanged = (inSettings != lastInSettings) ||
+                           (settingsItem != lastSettingsItem) ||
+                           (settingsEditing != lastSettingsEditing) ||
+                           (fabs(tcSmoothing - lastTcSmoothing) > 0.01f) ||
+                           (fabs(tcOffset - lastTcOffset) > 0.01f);
+    if (settingsChanged) {
+      drawSettings();
+      lastInSettings = inSettings;
+      lastSettingsItem = settingsItem;
+      lastSettingsEditing = settingsEditing;
+      lastTcSmoothing = tcSmoothing;
+      lastTcOffset = tcOffset;
+    }
+  } else {
+    bool needsRedraw = (millis() - lastDrawTime >= DRAW_INTERVAL) ||
+                       (fabs(currentTempC - lastTempC) > 1.0) ||
+                       (abs(average - lastAverage) > 5) ||
+                       (encoder_value != lastEncoderVal) ||
+                       (selectedOption != lastSelectedOption) ||
+                       (loggingEnabled != lastLogging) ||
+                       (readProfileEnabled != lastProfile) ||
+                       (learnModeEnabled != lastLearnMode) ||
+                       (learnModeActive != lastLearnActive) ||
+                       (learnPhase != lastLearnPhase) ||
+                       (sdCardPresent != lastSdPresent) ||
+                       (rampActive != lastRampActive) ||
+                       (currentStep != lastCurrentStep) ||
+                       (abs(currentInternalTemp - lastInternalTemp) > 2) ||
+                       (inSettings != lastInSettings);
 
-  if (needsRedraw) {
-    drawMenu(setpointTemp);
-    lastDrawTime = millis();
-    lastTempC = currentTempC;
-    lastAverage = average;
-    lastEncoderVal = encoder_value;
-    lastSelectedOption = selectedOption;
-    lastLogging = loggingEnabled;
-    lastProfile = readProfileEnabled;
-    lastLearnMode = learnModeEnabled;
-    lastLearnActive = learnModeActive;
-    lastLearnPhase = learnPhase;
-    lastSdPresent = sdCardPresent;
-    lastRampActive = rampActive;
-    lastCurrentStep = currentStep;
-    lastInternalTemp = currentInternalTemp;
+    if (needsRedraw) {
+      drawMenu(setpointTemp);
+      lastDrawTime = millis();
+      lastTempC = currentTempC;
+      lastAverage = average;
+      lastEncoderVal = encoder_value;
+      lastSelectedOption = selectedOption;
+      lastLogging = loggingEnabled;
+      lastProfile = readProfileEnabled;
+      lastLearnMode = learnModeEnabled;
+      lastLearnActive = learnModeActive;
+      lastLearnPhase = learnPhase;
+      lastSdPresent = sdCardPresent;
+      lastRampActive = rampActive;
+      lastCurrentStep = currentStep;
+      lastInternalTemp = currentInternalTemp;
+      lastInSettings = inSettings;
+    }
   }
 
   delay(1);
@@ -453,6 +555,49 @@ void readPicoT() {
   average = total / numReadings;
 }
 
+void loadSettings() {
+  File f = SD.open("settings.csv", FILE_READ);
+  if (!f) return;
+
+  // Skip header
+  while (f.available() && f.read() != '\n');
+
+  char buffer[30];
+  size_t idx = 0;
+  while (f.available() && idx < sizeof(buffer) - 1) {
+    char ch = f.read();
+    if (ch == '\n' || ch == '\r') break;
+    buffer[idx++] = ch;
+  }
+  buffer[idx] = '\0';
+  f.close();
+
+  float s, o;
+  if (sscanf(buffer, "%f,%f", &s, &o) == 2) {
+    if (s >= 0.1f && s <= 1.0f) tcSmoothing = s;
+    if (o >= -10.0f && o <= 10.0f) tcOffset = o;
+    Serial.print("Settings loaded: smoothing=");
+    Serial.print(tcSmoothing);
+    Serial.print(" offset=");
+    Serial.println(tcOffset);
+  }
+}
+
+void saveSettings() {
+  SD.remove("settings.csv");
+  File f = SD.open("settings.csv", FILE_WRITE);
+  if (!f) {
+    Serial.println("Error saving settings");
+    return;
+  }
+  f.println("smoothing,offset");
+  f.print(tcSmoothing, 1);
+  f.print(",");
+  f.println(tcOffset, 1);
+  f.close();
+  Serial.println("Settings saved.");
+}
+
 void checkSDCard() {
   bool currentState = digitalRead(SD_CD) == LOW;
   if (currentState != sdCardPresent) {
@@ -463,6 +608,8 @@ void checkSDCard() {
       if (SD.begin(SD_CS, SPI1)) {
         Serial.println("SD card initialized successfully.");
         sdInitialized = true;
+
+        loadSettings();
 
         int fileCounter = 0;
         snprintf(logFileName, sizeof(logFileName), "log_%d.csv", fileCounter);
@@ -524,7 +671,6 @@ void readProfile() {
     return;
   }
 
-  // First pass: count valid lines
   int lineCount = 0;
   char buffer[50];
   while (profileFile.available()) {
@@ -555,7 +701,6 @@ void readProfile() {
     return;
   }
 
-  // Second pass: parse
   profileFile.seek(0);
   while (profileFile.available() && numSteps < lineCount) {
     size_t index = 0;
@@ -585,10 +730,8 @@ void loadLearnedData() {
   File f = SD.open("learned.csv", FILE_READ);
   if (!f) return;
 
-  // Skip header
   while (f.available() && f.read() != '\n');
 
-  // Count valid lines
   int count = 0;
   long dataStart = f.position();
   char buffer[120];
@@ -665,18 +808,15 @@ float tickLearnMode() {
   float target = steps[currentStep].targetTemp;
   unsigned long now = millis();
 
-  // Rate of rise from previous reading
   float rate = 0;
   if (learnPrevTime > 0 && (now - learnPrevTime) > 0) {
     rate = (currentTempC - learnPrevTemp) / ((now - learnPrevTime) / 1000.0f);
   }
 
-  // Check for timeout
   if (learnPhase == LEARN_HEATING && (now - learnStepStartTime) > LEARN_TIMEOUT_MS) {
     Serial.print("Step ");
     Serial.print(currentStep);
-    Serial.println(" TIMEOUT — skipping");
-    // Record partial data
+    Serial.println(" TIMEOUT");
     learned[currentStep].targetTemp = target;
     learned[currentStep].prevSettledTemp = (currentStep == 0) ? startTemp : steps[currentStep - 1].targetTemp;
     learned[currentStep].timeToReach = -1;
@@ -684,7 +824,6 @@ float tickLearnMode() {
     learned[currentStep].settleTime = 0;
     learned[currentStep].rateOfRise = rate;
     learned[currentStep].earlyCutoff = 0;
-    // Advance
     currentStep++;
     if (currentStep >= numSteps) {
       numLearned = numSteps;
@@ -705,7 +844,6 @@ float tickLearnMode() {
     return target;
   }
 
-  // Determine early cutoff from previous learned data
   float cutoffTemp = target;
   if (currentStep < numLearned &&
       learned[currentStep].targetTemp == target &&
@@ -717,7 +855,6 @@ float tickLearnMode() {
     case LEARN_HEATING:
       digitalWrite(esc, HIGH);
       digitalWrite(relay, HIGH);
-
       if (currentTempC >= cutoffTemp) {
         learnRateAtCutoff = rate;
         learnTargetCrossTime = now;
@@ -734,11 +871,9 @@ float tickLearnMode() {
     case LEARN_OVERSHOOT:
       digitalWrite(esc, HIGH);
       digitalWrite(relay, LOW);
-
       if (currentTempC > learnPeakTemp) {
         learnPeakTemp = currentTempC;
       }
-      // Peak passed when temp drops 0.5C below recorded peak
       if (currentTempC < learnPeakTemp - 0.5f) {
         learnPhase = LEARN_SETTLING;
         Serial.print("Step ");
@@ -751,14 +886,11 @@ float tickLearnMode() {
     case LEARN_SETTLING:
       digitalWrite(esc, HIGH);
       digitalWrite(relay, LOW);
-
       if (currentTempC <= target + 1.0f) {
         float timeToReach = (learnTargetCrossTime - learnStepStartTime) / 1000.0f;
         float overshoot = learnPeakTemp - target;
         float settleTime = (now - learnTargetCrossTime) / 1000.0f;
         float prevSettled = (currentStep == 0) ? startTemp : steps[currentStep - 1].targetTemp;
-
-        // Early cutoff: 80% of overshoot
         float earlyCut = overshoot * 0.8f;
         if (earlyCut < 0) earlyCut = 0;
 
@@ -797,9 +929,7 @@ float tickLearnMode() {
       break;
 
     case LEARN_COOLING:
-      // Passive cooling — everything off
       stopAllOutputs();
-
       if (currentTempC <= target + 1.0f) {
         float coolTime = (now - learnStepStartTime) / 1000.0f;
         float prevSettled = (currentStep == 0) ? startTemp : steps[currentStep - 1].targetTemp;
@@ -861,6 +991,49 @@ void drawPaddedStr(int x, int y, const char* str, int padWidth, uint16_t fg, uin
   tft.print(buf);
 }
 
+void drawSettings() {
+  tft.startWrite();
+  tft.setTextSize(menuTextSize);
+
+  // Title
+  drawPaddedStr(11, 13, "SETTINGS", 20, TFT_YELLOW, TFT_BLACK);
+
+  // Smoothing (y=45)
+  uint16_t smBg = settingsItem == 0 ? TFT_BLUE : TFT_BLACK;
+  uint16_t smFg = (settingsItem == 0 && settingsEditing) ? TFT_GREEN : textColour;
+  tft.fillRect(10, 45, 350, 22, smBg);
+  char smText[30];
+  snprintf(smText, sizeof(smText), "Smoothing: %.1f", tcSmoothing);
+  drawPaddedStr(11, 47, smText, 25, smFg, smBg);
+
+  // Offset (y=75)
+  uint16_t ofBg = settingsItem == 1 ? TFT_BLUE : TFT_BLACK;
+  uint16_t ofFg = (settingsItem == 1 && settingsEditing) ? TFT_GREEN : textColour;
+  tft.fillRect(10, 75, 350, 22, ofBg);
+  char ofText[30];
+  snprintf(ofText, sizeof(ofText), "Offset: %+.1fC", tcOffset);
+  drawPaddedStr(11, 77, ofText, 25, ofFg, ofBg);
+
+  // Back (y=105)
+  uint16_t bkBg = settingsItem == 2 ? TFT_BLUE : TFT_BLACK;
+  tft.fillRect(10, 105, 350, 22, bkBg);
+  drawPaddedStr(11, 107, "< Back", 25, textColour, bkBg);
+
+  // Hint
+  if (settingsEditing) {
+    drawPaddedStr(11, 145, "Rotate to adjust, press to confirm", 38, TFT_DARKGREY, TFT_BLACK);
+  } else {
+    drawPaddedStr(11, 145, "Press to edit, rotate to navigate  ", 38, TFT_DARKGREY, TFT_BLACK);
+  }
+
+  tft.setTextSize(textSize);
+
+  // Still show TC temp at bottom
+  drawPaddedStr(11, 238, tc_str, 8, textColour, TFT_BLACK);
+
+  tft.endWrite();
+}
+
 void drawMenu(float setpointTemp) {
   tft.startWrite();
   tft.setTextSize(menuTextSize);
@@ -874,25 +1047,32 @@ void drawMenu(float setpointTemp) {
   uint16_t logBg   = selectedOption == 0 ? TFT_BLUE : TFT_BLACK;
   uint16_t profBg  = selectedOption == 1 ? TFT_BLUE : TFT_BLACK;
   uint16_t learnBg = selectedOption == 2 ? TFT_BLUE : TFT_BLACK;
+  uint16_t settBg  = selectedOption == 3 ? TFT_BLUE : TFT_BLACK;
 
   if (selectedOption != lastSelectedOption || loggingEnabled != lastLogging) {
     tft.fillRect(10, 35, 280, 22, logBg);
     drawPaddedStr(11, 37, loggingEnabled ? "Logging: ON" : "Logging: OFF", 20, textColour, logBg);
   }
 
-  // Profile option (y=60)
+  // Profile option (y=57)
   if (selectedOption != lastSelectedOption || readProfileEnabled != lastProfile) {
-    tft.fillRect(10, 60, 280, 22, profBg);
-    drawPaddedStr(11, 62, readProfileEnabled ? "Profile: ON" : "Profile: OFF", 20, textColour, profBg);
+    tft.fillRect(10, 57, 280, 22, profBg);
+    drawPaddedStr(11, 59, readProfileEnabled ? "Profile: ON" : "Profile: OFF", 20, textColour, profBg);
   }
 
-  // Learn mode option (y=85)
+  // Learn mode option (y=79)
   if (selectedOption != lastSelectedOption || learnModeEnabled != lastLearnMode) {
-    tft.fillRect(10, 85, 280, 22, learnBg);
-    drawPaddedStr(11, 87, learnModeEnabled ? "Learn: ON" : "Learn: OFF", 20, textColour, learnBg);
+    tft.fillRect(10, 79, 280, 22, learnBg);
+    drawPaddedStr(11, 81, learnModeEnabled ? "Learn: ON" : "Learn: OFF", 20, textColour, learnBg);
   }
 
-  // Status line (y=112)
+  // Settings option (y=101)
+  if (selectedOption != lastSelectedOption) {
+    tft.fillRect(10, 101, 280, 22, settBg);
+    drawPaddedStr(11, 103, "Settings", 20, textColour, settBg);
+  }
+
+  // Status line (y=128)
   bool statusActive = learnModeActive || rampActive;
   bool lastStatusActive = lastLearnActive || lastRampActive;
   if (statusActive) {
@@ -915,35 +1095,35 @@ void drawMenu(float setpointTemp) {
         snprintf(statusText, sizeof(statusText), "Run %d/%d: %.0fC target",
                  currentStep + 1, numSteps, setpointTemp);
       }
-      drawPaddedStr(11, 114, statusText, 38, textColour, TFT_BLACK);
+      drawPaddedStr(11, 130, statusText, 38, textColour, TFT_BLACK);
     }
   } else if (lastStatusActive) {
-    tft.fillRect(10, 112, 460, 22, TFT_BLACK);
+    tft.fillRect(10, 128, 460, 22, TFT_BLACK);
   }
 
   tft.setTextSize(textSize);
 
-  // Pot average (y=140)
+  // Pot average (y=155)
   if (abs(average - lastAverage) > 0) {
     itoa(average, analog, 10);
-    drawPaddedStr(11, 142, analog, 8, textColour, TFT_BLACK);
+    drawPaddedStr(11, 157, analog, 8, textColour, TFT_BLACK);
   }
 
-  // Encoder (y=172)
+  // Encoder (y=185)
   if (encoder_value != lastEncoderVal) {
     itoa(encoder_value, analog, 10);
-    drawPaddedStr(11, 174, analog, 8, textColour, TFT_BLACK);
+    drawPaddedStr(11, 187, analog, 8, textColour, TFT_BLACK);
   }
 
-  // Internal temp (y=204)
+  // Internal temp (y=215)
   if (abs(currentInternalTemp - lastInternalTemp) > 0) {
     itoa(currentInternalTemp, analog, 10);
-    drawPaddedStr(11, 206, analog, 8, textColour, TFT_BLACK);
+    drawPaddedStr(11, 217, analog, 8, textColour, TFT_BLACK);
   }
 
-  // TC temp (y=236)
+  // TC temp (y=245)
   if (strcmp(tc_str, lastTcStr) != 0) {
-    drawPaddedStr(11, 238, tc_str, 8, textColour, TFT_BLACK);
+    drawPaddedStr(11, 247, tc_str, 8, textColour, TFT_BLACK);
     strcpy(lastTcStr, tc_str);
   }
 
