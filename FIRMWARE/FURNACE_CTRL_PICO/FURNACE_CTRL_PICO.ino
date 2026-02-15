@@ -23,7 +23,8 @@ volatile bool swPressed = false;
 #define textSize 3
 #define menuTextSize 2
 #define NUM_OPTIONS 4
-#define NUM_SETTINGS 3
+#define NUM_SETTINGS 4
+#define MAX_MEDIAN_WINDOW 15
 #define DRAW_INTERVAL 250
 
 #include "Adafruit_MAX31855.h"
@@ -60,6 +61,7 @@ int selectedOption = 0;
 // Settings
 float tcSmoothing = 0.3f;
 float tcOffset = 0.0f;
+int tcMedianWindow = 7;
 float smoothedTempC = 0;
 bool smoothedSeeded = false;
 bool inSettings = false;
@@ -67,9 +69,15 @@ int settingsItem = 0;
 bool settingsEditing = false;
 float lastTcSmoothing = -1;
 float lastTcOffset = -99;
+int lastTcMedianWindow = -1;
 int lastSettingsItem = -1;
 bool lastSettingsEditing = false;
 bool lastInSettings = false;
+
+// Median filter circular buffer
+float tcBuffer[MAX_MEDIAN_WINDOW];
+int tcBufferIdx = 0;
+int tcBufferCount = 0;
 
 // Profile steps — single-column target temperatures
 struct RampStep {
@@ -144,6 +152,27 @@ void freeProfile();
 void freeLearned();
 void resetLearnState();
 
+float medianFilter(float newVal) {
+  tcBuffer[tcBufferIdx] = newVal;
+  tcBufferIdx = (tcBufferIdx + 1) % tcMedianWindow;
+  if (tcBufferCount < tcMedianWindow) tcBufferCount++;
+
+  // Copy active samples and sort
+  float sorted[MAX_MEDIAN_WINDOW];
+  int n = tcBufferCount;
+  for (int i = 0; i < n; i++) sorted[i] = tcBuffer[i];
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = i + 1; j < n; j++) {
+      if (sorted[j] < sorted[i]) {
+        float tmp = sorted[i];
+        sorted[i] = sorted[j];
+        sorted[j] = tmp;
+      }
+    }
+  }
+  return sorted[n / 2];
+}
+
 void setup() {
   Serial.begin(115200);
   pinMode(8, INPUT_PULLUP);
@@ -176,10 +205,14 @@ void setup() {
 
   delay(500);
 
-  // Seed smoothed temp with first valid reading
+  // Seed smoothed temp and median buffer with first valid reading
   float initTemp = thermocouple.readCelsius();
   if (!isnan(initTemp)) {
-    smoothedTempC = initTemp + tcOffset;
+    float adj = initTemp + tcOffset;
+    for (int i = 0; i < tcMedianWindow; i++) tcBuffer[i] = adj;
+    tcBufferCount = tcMedianWindow;
+    tcBufferIdx = 0;
+    smoothedTempC = adj;
     smoothedSeeded = true;
   }
 
@@ -223,11 +256,12 @@ void loop() {
     currentTempC = rawTempC;
   } else {
     float adjusted = rawTempC + tcOffset;
+    float filtered = medianFilter(adjusted);
     if (!smoothedSeeded) {
-      smoothedTempC = adjusted;
+      smoothedTempC = filtered;
       smoothedSeeded = true;
     } else {
-      smoothedTempC = tcSmoothing * adjusted + (1.0f - tcSmoothing) * smoothedTempC;
+      smoothedTempC = tcSmoothing * filtered + (1.0f - tcSmoothing) * smoothedTempC;
     }
     currentTempC = smoothedTempC;
     dtostrf(currentTempC, 4, 1, tc_str);
@@ -252,6 +286,13 @@ void loop() {
           tcOffset += delta * 0.1f;
           if (tcOffset < -10.0f) tcOffset = -10.0f;
           if (tcOffset > 10.0f) tcOffset = 10.0f;
+        } else if (settingsItem == 2) {
+          tcMedianWindow += delta;
+          if (tcMedianWindow < 1) tcMedianWindow = 1;
+          if (tcMedianWindow > MAX_MEDIAN_WINDOW) tcMedianWindow = MAX_MEDIAN_WINDOW;
+          // Reset buffer when window size changes
+          tcBufferIdx = 0;
+          tcBufferCount = 0;
         }
       } else {
         // Navigate settings items
@@ -272,7 +313,7 @@ void loop() {
   if (pressed) {
     if (inSettings) {
       // Settings sub-menu button handling
-      if (settingsItem == 2) {
+      if (settingsItem == 3) {
         // "Back" — exit settings, save
         inSettings = false;
         settingsEditing = false;
@@ -452,7 +493,8 @@ void loop() {
                            (settingsItem != lastSettingsItem) ||
                            (settingsEditing != lastSettingsEditing) ||
                            (fabs(tcSmoothing - lastTcSmoothing) > 0.01f) ||
-                           (fabs(tcOffset - lastTcOffset) > 0.01f);
+                           (fabs(tcOffset - lastTcOffset) > 0.01f) ||
+                           (tcMedianWindow != lastTcMedianWindow);
     if (settingsChanged) {
       drawSettings();
       lastInSettings = inSettings;
@@ -460,6 +502,7 @@ void loop() {
       lastSettingsEditing = settingsEditing;
       lastTcSmoothing = tcSmoothing;
       lastTcOffset = tcOffset;
+      lastTcMedianWindow = tcMedianWindow;
     }
   } else {
     bool needsRedraw = (millis() - lastDrawTime >= DRAW_INTERVAL) ||
@@ -573,13 +616,17 @@ void loadSettings() {
   f.close();
 
   float s, o;
-  if (sscanf(buffer, "%f,%f", &s, &o) == 2) {
+  int m;
+  if (sscanf(buffer, "%f,%f,%d", &s, &o, &m) >= 2) {
     if (s >= 0.1f && s <= 1.0f) tcSmoothing = s;
     if (o >= -10.0f && o <= 10.0f) tcOffset = o;
+    if (m >= 1 && m <= MAX_MEDIAN_WINDOW) tcMedianWindow = m;
     Serial.print("Settings loaded: smoothing=");
     Serial.print(tcSmoothing);
     Serial.print(" offset=");
-    Serial.println(tcOffset);
+    Serial.print(tcOffset);
+    Serial.print(" median=");
+    Serial.println(tcMedianWindow);
   }
 }
 
@@ -590,10 +637,12 @@ void saveSettings() {
     Serial.println("Error saving settings");
     return;
   }
-  f.println("smoothing,offset");
+  f.println("smoothing,offset,median");
   f.print(tcSmoothing, 1);
   f.print(",");
-  f.println(tcOffset, 1);
+  f.print(tcOffset, 1);
+  f.print(",");
+  f.println(tcMedianWindow);
   f.close();
   Serial.println("Settings saved.");
 }
@@ -1014,16 +1063,24 @@ void drawSettings() {
   snprintf(ofText, sizeof(ofText), "Offset: %+.1fC", tcOffset);
   drawPaddedStr(11, 77, ofText, 25, ofFg, ofBg);
 
-  // Back (y=105)
-  uint16_t bkBg = settingsItem == 2 ? TFT_BLUE : TFT_BLACK;
-  tft.fillRect(10, 105, 350, 22, bkBg);
-  drawPaddedStr(11, 107, "< Back", 25, textColour, bkBg);
+  // Median window (y=105)
+  uint16_t mdBg = settingsItem == 2 ? TFT_BLUE : TFT_BLACK;
+  uint16_t mdFg = (settingsItem == 2 && settingsEditing) ? TFT_GREEN : textColour;
+  tft.fillRect(10, 105, 350, 22, mdBg);
+  char mdText[30];
+  snprintf(mdText, sizeof(mdText), "Median: %d samples", tcMedianWindow);
+  drawPaddedStr(11, 107, mdText, 25, mdFg, mdBg);
+
+  // Back (y=135)
+  uint16_t bkBg = settingsItem == 3 ? TFT_BLUE : TFT_BLACK;
+  tft.fillRect(10, 135, 350, 22, bkBg);
+  drawPaddedStr(11, 137, "< Back", 25, textColour, bkBg);
 
   // Hint
   if (settingsEditing) {
-    drawPaddedStr(11, 145, "Rotate to adjust, press to confirm", 38, TFT_DARKGREY, TFT_BLACK);
+    drawPaddedStr(11, 175, "Rotate to adjust, press to confirm", 38, TFT_DARKGREY, TFT_BLACK);
   } else {
-    drawPaddedStr(11, 145, "Press to edit, rotate to navigate  ", 38, TFT_DARKGREY, TFT_BLACK);
+    drawPaddedStr(11, 175, "Press to edit, rotate to navigate  ", 38, TFT_DARKGREY, TFT_BLACK);
   }
 
   tft.setTextSize(textSize);
