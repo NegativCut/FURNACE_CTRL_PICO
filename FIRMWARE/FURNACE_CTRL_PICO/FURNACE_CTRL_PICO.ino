@@ -23,7 +23,7 @@ volatile bool swPressed = false;
 #define textSize 3
 #define menuTextSize 2
 #define NUM_OPTIONS 4
-#define NUM_SETTINGS 4
+#define NUM_SETTINGS 6
 #define MAX_MEDIAN_WINDOW 128
 #define DRAW_INTERVAL 250
 
@@ -67,6 +67,8 @@ bool smoothedSeeded = false;
 bool inSettings = false;
 int settingsItem = 0;
 bool settingsEditing = false;
+bool testEsc = false;
+bool testRelay = false;
 float lastTcSmoothing = -1;
 float lastTcOffset = -99;
 int lastTcMedianWindow = -1;
@@ -79,9 +81,10 @@ float tcBuffer[MAX_MEDIAN_WINDOW];
 int tcBufferIdx = 0;
 int tcBufferCount = 0;
 
-// Profile steps — single-column target temperatures
+// Profile steps — target temperatures with optional dwell
 struct RampStep {
   float targetTemp;
+  unsigned long dwellMs;  // 0 = no dwell
 };
 RampStep* steps = NULL;
 int numSteps = 0;
@@ -89,6 +92,10 @@ int currentStep = 0;
 float startTemp = 0;
 bool rampActive = false;
 bool rampHeating = true;
+
+// Dwell state
+bool dwelling = false;
+unsigned long dwellStartTime = 0;
 
 // Learned thermal data per step
 struct LearnedStep {
@@ -135,6 +142,7 @@ bool lastLearnMode = false;
 bool lastLearnActive = false;
 LearnPhase lastLearnPhase = LEARN_IDLE;
 int lastCurrentStep = -1;
+bool lastDwelling = false;
 int lastInternalTemp = 0;
 char lastTcStr[10];
 
@@ -313,10 +321,13 @@ void loop() {
   if (pressed) {
     if (inSettings) {
       // Settings sub-menu button handling
-      if (settingsItem == 3) {
-        // "Back" — exit settings, save
+      if (settingsItem == 5) {
+        // "Back" — exit settings, save, stop test outputs
         inSettings = false;
         settingsEditing = false;
+        testEsc = false;
+        testRelay = false;
+        stopAllOutputs();
         if (sdCardPresent && sdInitialized) saveSettings();
         tft.fillScreen(TFT_BLACK);
         // Force full main menu redraw
@@ -332,8 +343,18 @@ void loop() {
         lastAverage = average - 1;
         lastInternalTemp = currentInternalTemp - 1;
         lastEncoderVal = encoder_value - 1;
+      } else if (settingsItem == 3) {
+        // Toggle ESC output
+        testEsc = !testEsc;
+        digitalWrite(esc, testEsc ? HIGH : LOW);
+        lastSettingsItem = -1;  // force redraw
+      } else if (settingsItem == 4) {
+        // Toggle Relay output
+        testRelay = !testRelay;
+        digitalWrite(relay, testRelay ? HIGH : LOW);
+        lastSettingsItem = -1;  // force redraw
       } else {
-        // Toggle edit mode for smoothing or offset
+        // Toggle edit mode for smoothing, offset, median
         settingsEditing = !settingsEditing;
       }
 
@@ -366,6 +387,7 @@ void loop() {
           }
         } else {
           rampActive = false;
+          dwelling = false;
           freeProfile();
           stopAllOutputs();
         }
@@ -460,23 +482,52 @@ void loop() {
         digitalWrite(relay, LOW);
         digitalWrite(esc, HIGH);
         if (currentTempC <= target + 1.0f && currentTempC >= target - 1.0f) {
-          currentStep++;
-          rampHeating = true;
-          if (currentStep >= numSteps) {
-            rampActive = false;
-            stopAllOutputs();
+          // Temperature reached — handle dwell or advance
+          if (steps[currentStep].dwellMs > 0 && !dwelling) {
+            dwelling = true;
+            dwellStartTime = millis();
+          } else if (dwelling && (millis() - dwellStartTime) >= steps[currentStep].dwellMs) {
+            dwelling = false;
+            currentStep++;
+            rampHeating = true;
+            if (currentStep >= numSteps) {
+              rampActive = false;
+              stopAllOutputs();
+            }
+          } else if (steps[currentStep].dwellMs == 0) {
+            currentStep++;
+            rampHeating = true;
+            if (currentStep >= numSteps) {
+              rampActive = false;
+              stopAllOutputs();
+            }
           }
+          // During dwell on a heating step, keep esc HIGH (fan) to maintain temp
         }
       }
     } else {
       digitalWrite(relay, LOW);
       digitalWrite(esc, LOW);
       if (currentTempC <= target + 1.0f) {
-        currentStep++;
-        rampHeating = true;
-        if (currentStep >= numSteps) {
-          rampActive = false;
-          stopAllOutputs();
+        // Temperature reached — handle dwell or advance
+        if (steps[currentStep].dwellMs > 0 && !dwelling) {
+          dwelling = true;
+          dwellStartTime = millis();
+        } else if (dwelling && (millis() - dwellStartTime) >= steps[currentStep].dwellMs) {
+          dwelling = false;
+          currentStep++;
+          rampHeating = true;
+          if (currentStep >= numSteps) {
+            rampActive = false;
+            stopAllOutputs();
+          }
+        } else if (steps[currentStep].dwellMs == 0) {
+          currentStep++;
+          rampHeating = true;
+          if (currentStep >= numSteps) {
+            rampActive = false;
+            stopAllOutputs();
+          }
         }
       }
     }
@@ -517,6 +568,8 @@ void loop() {
                        (learnPhase != lastLearnPhase) ||
                        (sdCardPresent != lastSdPresent) ||
                        (rampActive != lastRampActive) ||
+                       (dwelling != lastDwelling) ||
+                       (dwelling) ||  // redraw during dwell for countdown
                        (currentStep != lastCurrentStep) ||
                        (abs(currentInternalTemp - lastInternalTemp) > 2) ||
                        (inSettings != lastInSettings);
@@ -535,6 +588,7 @@ void loop() {
       lastLearnPhase = learnPhase;
       lastSdPresent = sdCardPresent;
       lastRampActive = rampActive;
+      lastDwelling = dwelling;
       lastCurrentStep = currentStep;
       lastInternalTemp = currentInternalTemp;
       lastInSettings = inSettings;
@@ -671,7 +725,7 @@ void checkSDCard() {
         if (logFile) {
           Serial.print("Created log file: ");
           Serial.println(logFileName);
-          logFile.println("Timestamp,PotValue,EncoderValue,InternalTemp,ThermocoupleTemp,SetpointTemp,SSR_Esc,SSR_Relay,Step,LearnPhase");
+          logFile.println("Timestamp,PotValue,EncoderValue,InternalTemp,ThermocoupleTemp,SetpointTemp,SSR_Esc,SSR_Relay,Step,LearnPhase,Dwelling");
           logFile.close();
         } else {
           Serial.println("Error creating log file.");
@@ -700,6 +754,7 @@ void checkSDCard() {
       loggingEnabled = false;
       readProfileEnabled = false;
       rampActive = false;
+      dwelling = false;
       freeProfile();
       resetLearnState();
       freeLearned();
@@ -763,6 +818,14 @@ void readProfile() {
     float temp = atof(buffer);
     if (temp > 0 && !isnan(temp)) {
       steps[numSteps].targetTemp = temp;
+      // Parse optional dwell_seconds after comma
+      char* comma = strchr(buffer, ',');
+      if (comma) {
+        unsigned long dwellSec = strtoul(comma + 1, NULL, 10);
+        steps[numSteps].dwellMs = dwellSec * 1000UL;
+      } else {
+        steps[numSteps].dwellMs = 0;
+      }
       numSteps++;
     }
   }
@@ -1071,22 +1134,34 @@ void drawSettings() {
   snprintf(mdText, sizeof(mdText), "Median: %d samples", tcMedianWindow);
   drawPaddedStr(11, 107, mdText, 25, mdFg, mdBg);
 
-  // Back (y=135)
-  uint16_t bkBg = settingsItem == 3 ? TFT_BLUE : TFT_BLACK;
-  tft.fillRect(10, 135, 350, 22, bkBg);
-  drawPaddedStr(11, 137, "< Back", 25, textColour, bkBg);
+  // ESC output (y=135)
+  uint16_t escBg = settingsItem == 3 ? TFT_BLUE : TFT_BLACK;
+  tft.fillRect(10, 135, 350, 22, escBg);
+  uint16_t escFg = testEsc ? TFT_GREEN : textColour;
+  drawPaddedStr(11, 137, testEsc ? "ESC: ON" : "ESC: OFF", 25, escFg, escBg);
+
+  // Relay output (y=165)
+  uint16_t relBg = settingsItem == 4 ? TFT_BLUE : TFT_BLACK;
+  tft.fillRect(10, 165, 350, 22, relBg);
+  uint16_t relFg = testRelay ? TFT_GREEN : textColour;
+  drawPaddedStr(11, 167, testRelay ? "Relay: ON" : "Relay: OFF", 25, relFg, relBg);
+
+  // Back (y=195)
+  uint16_t bkBg = settingsItem == 5 ? TFT_BLUE : TFT_BLACK;
+  tft.fillRect(10, 195, 350, 22, bkBg);
+  drawPaddedStr(11, 197, "< Back", 25, textColour, bkBg);
 
   // Hint
   if (settingsEditing) {
-    drawPaddedStr(11, 175, "Rotate to adjust, press to confirm", 38, TFT_DARKGREY, TFT_BLACK);
+    drawPaddedStr(11, 235, "Rotate to adjust, press to confirm", 38, TFT_DARKGREY, TFT_BLACK);
   } else {
-    drawPaddedStr(11, 175, "Press to edit, rotate to navigate  ", 38, TFT_DARKGREY, TFT_BLACK);
+    drawPaddedStr(11, 235, "Press to edit, rotate to navigate  ", 38, TFT_DARKGREY, TFT_BLACK);
   }
 
   tft.setTextSize(textSize);
 
   // Still show TC temp at bottom
-  drawPaddedStr(11, 238, tc_str, 8, textColour, TFT_BLACK);
+  drawPaddedStr(11, 270, tc_str, 8, textColour, TFT_BLACK);
 
   tft.endWrite();
 }
@@ -1134,7 +1209,8 @@ void drawMenu(float setpointTemp) {
   bool lastStatusActive = lastLearnActive || lastRampActive;
   if (statusActive) {
     if (statusActive != lastStatusActive || currentStep != lastCurrentStep ||
-        learnPhase != lastLearnPhase || learnModeActive != lastLearnActive) {
+        learnPhase != lastLearnPhase || learnModeActive != lastLearnActive ||
+        dwelling != lastDwelling || dwelling) {
       char statusText[50];
       if (learnModeActive && currentStep < numSteps) {
         const char* phaseStr = "IDLE";
@@ -1149,8 +1225,19 @@ void drawMenu(float setpointTemp) {
         snprintf(statusText, sizeof(statusText), "Learn %d/%d: %.0fC [%s]",
                  currentStep + 1, numSteps, steps[currentStep].targetTemp, phaseStr);
       } else if (rampActive && currentStep < numSteps) {
-        snprintf(statusText, sizeof(statusText), "Run %d/%d: %.0fC target",
-                 currentStep + 1, numSteps, setpointTemp);
+        if (dwelling) {
+          unsigned long elapsed = millis() - dwellStartTime;
+          unsigned long remaining = 0;
+          if (elapsed < steps[currentStep].dwellMs)
+            remaining = (steps[currentStep].dwellMs - elapsed) / 1000UL;
+          unsigned long mins = remaining / 60;
+          unsigned long secs = remaining % 60;
+          snprintf(statusText, sizeof(statusText), "Run %d/%d: %.0fC DWELL %lu:%02lu",
+                   currentStep + 1, numSteps, setpointTemp, mins, secs);
+        } else {
+          snprintf(statusText, sizeof(statusText), "Run %d/%d: %.0fC target",
+                   currentStep + 1, numSteps, setpointTemp);
+        }
       }
       drawPaddedStr(11, 130, statusText, 38, textColour, TFT_BLACK);
     }
@@ -1212,6 +1299,8 @@ void logData(float setpointTemp) {
     logFile.print(logStep);
     logFile.print(",");
     logFile.print((int)learnPhase);
+    logFile.print(",");
+    logFile.print(dwelling ? 1 : 0);
     logFile.println();
     logFile.close();
   } else {
