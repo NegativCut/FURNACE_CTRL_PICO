@@ -24,7 +24,7 @@ volatile bool swPressed = false;
 #define menuTextSize 2
 #define NUM_OPTIONS 4
 #define NUM_SETTINGS 4
-#define MAX_MEDIAN_WINDOW 15
+#define MAX_MEDIAN_WINDOW 128
 #define DRAW_INTERVAL 250
 
 #include "Adafruit_MAX31855.h"
