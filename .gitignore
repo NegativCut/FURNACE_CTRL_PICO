@@ -1,0 +1,25 @@
+# Build artifacts
+*.elf
+*.bin
+*.hex
+*.uf2
+*.map
+*.lst
+
+# IDE and editor files
+*.swp
+*.swo
+*~
+.vscode/
+*.code-workspace
+
+# Arduino IDE
+build/
+
+# Claude Code
+.claude/
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
