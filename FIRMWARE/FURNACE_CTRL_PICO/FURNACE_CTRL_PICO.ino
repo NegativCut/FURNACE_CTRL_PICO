@@ -3,6 +3,8 @@
 #include <Wire.h>
 #include <TFT_eSPI.h>
 #include <SD.h>
+#include <Servo.h>
+Servo escServo;
 TFT_eSPI tft = TFT_eSPI();
 
 #include "hardware/pio.h"
@@ -23,7 +25,7 @@ volatile bool swPressed = false;
 #define textSize 3
 #define menuTextSize 2
 #define NUM_OPTIONS 4
-#define NUM_SETTINGS 6
+#define NUM_SETTINGS 7
 #define MAX_MEDIAN_WINDOW 128
 #define DRAW_INTERVAL 250
 
@@ -33,8 +35,8 @@ volatile bool swPressed = false;
 #define MAXCLK  7
 Adafruit_MAX31855 thermocouple(MAXCLK, MAXCS, MAXDO);
 
-int esc = 11;
-int relay = 18;
+int esc = 4;
+int relay = 11;
 int ledpin = 25;
 const int pot = 26;
 char analog[12];
@@ -67,7 +69,8 @@ bool smoothedSeeded = false;
 bool inSettings = false;
 int settingsItem = 0;
 bool settingsEditing = false;
-bool testEsc = false;
+bool testEscOn = false;
+int testEscPct = 50;   // 0-100% in 5% steps
 bool testRelay = false;
 float lastTcSmoothing = -1;
 float lastTcOffset = -99;
@@ -159,6 +162,18 @@ void stopAllOutputs();
 void freeProfile();
 void freeLearned();
 void resetLearnState();
+void escOn();
+void escOff();
+
+void escOn() {
+  if (!escServo.attached()) escServo.attach(esc);
+  escServo.write(180);
+}
+
+void escOff() {
+  escServo.write(0);
+  escServo.detach();
+}
 
 float medianFilter(float newVal) {
   tcBuffer[tcBufferIdx] = newVal;
@@ -193,7 +208,6 @@ void setup() {
   tft.setSwapBytes(false);
   tft.fillScreen(TFT_BLACK);
 
-  pinMode(esc, OUTPUT);
   pinMode(relay, OUTPUT);
   pinMode(ledpin, OUTPUT);
   stopAllOutputs();
@@ -301,6 +315,14 @@ void loop() {
           // Reset buffer when window size changes
           tcBufferIdx = 0;
           tcBufferCount = 0;
+        } else if (settingsItem == 4) {
+          testEscPct += delta * 5;
+          if (testEscPct < 0) testEscPct = 0;
+          if (testEscPct > 100) testEscPct = 100;
+          if (testEscOn) {
+            if (!escServo.attached()) escServo.attach(esc);
+            escServo.write((int)((long)testEscPct * 180 / 100));
+          }
         }
       } else {
         // Navigate settings items
@@ -321,11 +343,12 @@ void loop() {
   if (pressed) {
     if (inSettings) {
       // Settings sub-menu button handling
-      if (settingsItem == 5) {
+      if (settingsItem == 6) {
         // "Back" — exit settings, save, stop test outputs
         inSettings = false;
         settingsEditing = false;
-        testEsc = false;
+        testEscOn = false;
+        escOff();
         testRelay = false;
         stopAllOutputs();
         if (sdCardPresent && sdInitialized) saveSettings();
@@ -344,11 +367,19 @@ void loop() {
         lastInternalTemp = currentInternalTemp - 1;
         lastEncoderVal = encoder_value - 1;
       } else if (settingsItem == 3) {
-        // Toggle ESC output
-        testEsc = !testEsc;
-        digitalWrite(esc, testEsc ? HIGH : LOW);
+        // Toggle ESC on/off
+        testEscOn = !testEscOn;
+        if (testEscOn) {
+          if (!escServo.attached()) escServo.attach(esc);
+          escServo.write((int)((long)testEscPct * 180 / 100));
+        } else {
+          escOff();
+        }
         lastSettingsItem = -1;  // force redraw
       } else if (settingsItem == 4) {
+        // Toggle ESC speed edit mode
+        settingsEditing = !settingsEditing;
+      } else if (settingsItem == 5) {
         // Toggle Relay output
         testRelay = !testRelay;
         digitalWrite(relay, testRelay ? HIGH : LOW);
@@ -475,12 +506,12 @@ void loop() {
 
     if (target >= currentTempC) {
       if (rampHeating && currentTempC < cutoff) {
-        digitalWrite(esc, HIGH);
+        escOn();
         digitalWrite(relay, HIGH);
       } else {
         rampHeating = false;
         digitalWrite(relay, LOW);
-        digitalWrite(esc, HIGH);
+        escOn();
         if (currentTempC <= target + 1.0f && currentTempC >= target - 1.0f) {
           // Temperature reached — handle dwell or advance
           if (steps[currentStep].dwellMs > 0 && !dwelling) {
@@ -507,7 +538,7 @@ void loop() {
       }
     } else {
       digitalWrite(relay, LOW);
-      digitalWrite(esc, LOW);
+      escOff();
       if (currentTempC <= target + 1.0f) {
         // Temperature reached — handle dwell or advance
         if (steps[currentStep].dwellMs > 0 && !dwelling) {
@@ -540,12 +571,16 @@ void loop() {
 
   // Draw
   if (inSettings) {
+    static bool lastTestEscOn = false;
+    static int lastTestEscPct = -1;
     bool settingsChanged = (inSettings != lastInSettings) ||
                            (settingsItem != lastSettingsItem) ||
                            (settingsEditing != lastSettingsEditing) ||
                            (fabs(tcSmoothing - lastTcSmoothing) > 0.01f) ||
                            (fabs(tcOffset - lastTcOffset) > 0.01f) ||
-                           (tcMedianWindow != lastTcMedianWindow);
+                           (tcMedianWindow != lastTcMedianWindow) ||
+                           (testEscOn != lastTestEscOn) ||
+                           (testEscPct != lastTestEscPct);
     if (settingsChanged) {
       drawSettings();
       lastInSettings = inSettings;
@@ -554,6 +589,8 @@ void loop() {
       lastTcSmoothing = tcSmoothing;
       lastTcOffset = tcOffset;
       lastTcMedianWindow = tcMedianWindow;
+      lastTestEscOn = testEscOn;
+      lastTestEscPct = testEscPct;
     }
   } else {
     bool needsRedraw = (millis() - lastDrawTime >= DRAW_INTERVAL) ||
@@ -615,7 +652,7 @@ void reSw() {
 }
 
 void stopAllOutputs() {
-  digitalWrite(esc, LOW);
+  escOff();
   digitalWrite(relay, LOW);
 }
 
@@ -965,7 +1002,7 @@ float tickLearnMode() {
 
   switch (learnPhase) {
     case LEARN_HEATING:
-      digitalWrite(esc, HIGH);
+      escOn();
       digitalWrite(relay, HIGH);
       if (currentTempC >= cutoffTemp) {
         learnRateAtCutoff = rate;
@@ -981,7 +1018,7 @@ float tickLearnMode() {
       break;
 
     case LEARN_OVERSHOOT:
-      digitalWrite(esc, HIGH);
+      escOn();
       digitalWrite(relay, LOW);
       if (currentTempC > learnPeakTemp) {
         learnPeakTemp = currentTempC;
@@ -996,7 +1033,7 @@ float tickLearnMode() {
       break;
 
     case LEARN_SETTLING:
-      digitalWrite(esc, HIGH);
+      escOn();
       digitalWrite(relay, LOW);
       if (currentTempC <= target + 1.0f) {
         float timeToReach = (learnTargetCrossTime - learnStepStartTime) / 1000.0f;
@@ -1134,34 +1171,42 @@ void drawSettings() {
   snprintf(mdText, sizeof(mdText), "Median: %d samples", tcMedianWindow);
   drawPaddedStr(11, 107, mdText, 25, mdFg, mdBg);
 
-  // ESC output (y=135)
+  // ESC on/off (y=135)
   uint16_t escBg = settingsItem == 3 ? TFT_BLUE : TFT_BLACK;
+  uint16_t escFg = testEscOn ? TFT_GREEN : textColour;
   tft.fillRect(10, 135, 350, 22, escBg);
-  uint16_t escFg = testEsc ? TFT_GREEN : textColour;
-  drawPaddedStr(11, 137, testEsc ? "ESC: ON" : "ESC: OFF", 25, escFg, escBg);
+  drawPaddedStr(11, 137, testEscOn ? "ESC: ON" : "ESC: OFF", 25, escFg, escBg);
 
-  // Relay output (y=165)
-  uint16_t relBg = settingsItem == 4 ? TFT_BLUE : TFT_BLACK;
-  tft.fillRect(10, 165, 350, 22, relBg);
+  // ESC speed (y=165)
+  uint16_t spdBg = settingsItem == 4 ? TFT_BLUE : TFT_BLACK;
+  uint16_t spdFg = (settingsItem == 4 && settingsEditing) ? TFT_GREEN : textColour;
+  tft.fillRect(10, 165, 350, 22, spdBg);
+  char spdText[30];
+  snprintf(spdText, sizeof(spdText), "ESC Speed: %d%%", testEscPct);
+  drawPaddedStr(11, 167, spdText, 25, spdFg, spdBg);
+
+  // Relay output (y=195)
+  uint16_t relBg = settingsItem == 5 ? TFT_BLUE : TFT_BLACK;
+  tft.fillRect(10, 195, 350, 22, relBg);
   uint16_t relFg = testRelay ? TFT_GREEN : textColour;
-  drawPaddedStr(11, 167, testRelay ? "Relay: ON" : "Relay: OFF", 25, relFg, relBg);
+  drawPaddedStr(11, 197, testRelay ? "Relay: ON" : "Relay: OFF", 25, relFg, relBg);
 
-  // Back (y=195)
-  uint16_t bkBg = settingsItem == 5 ? TFT_BLUE : TFT_BLACK;
-  tft.fillRect(10, 195, 350, 22, bkBg);
-  drawPaddedStr(11, 197, "< Back", 25, textColour, bkBg);
+  // Back (y=225)
+  uint16_t bkBg = settingsItem == 6 ? TFT_BLUE : TFT_BLACK;
+  tft.fillRect(10, 225, 350, 22, bkBg);
+  drawPaddedStr(11, 227, "< Back", 25, textColour, bkBg);
 
   // Hint
   if (settingsEditing) {
-    drawPaddedStr(11, 235, "Rotate to adjust, press to confirm", 38, TFT_DARKGREY, TFT_BLACK);
+    drawPaddedStr(11, 260, "Rotate to adjust, press to confirm", 38, TFT_DARKGREY, TFT_BLACK);
   } else {
-    drawPaddedStr(11, 235, "Press to edit, rotate to navigate  ", 38, TFT_DARKGREY, TFT_BLACK);
+    drawPaddedStr(11, 260, "Press to edit, rotate to navigate  ", 38, TFT_DARKGREY, TFT_BLACK);
   }
 
   tft.setTextSize(textSize);
 
   // Still show TC temp at bottom
-  drawPaddedStr(11, 270, tc_str, 8, textColour, TFT_BLACK);
+  drawPaddedStr(11, 290, tc_str, 8, textColour, TFT_BLACK);
 
   tft.endWrite();
 }
@@ -1291,7 +1336,7 @@ void logData(float setpointTemp) {
     logFile.print(",");
     logFile.print(setpointTemp);
     logFile.print(",");
-    logFile.print(digitalRead(esc));
+    logFile.print(escServo.attached() ? 1 : 0);
     logFile.print(",");
     logFile.print(digitalRead(relay));
     logFile.print(",");
