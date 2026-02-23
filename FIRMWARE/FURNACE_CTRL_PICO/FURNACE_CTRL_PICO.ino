@@ -1,3 +1,70 @@
+// =============================================================================
+// ELECTRICAL CONNECTIONS  (Arduino D-number / Pico physical pin)
+// =============================================================================
+//
+//  SPI0 — TFT Display (ILI9486 480×320)  [defined in User_Setup_pi_furnace.h]
+//    D0   pin  1   MISO
+//    D2   pin  4   SCK
+//    D3   pin  5   MOSI
+//    D20  pin 26   CS
+//    D21  pin 27   RST
+//    D22  pin 29   DC
+//
+//  SPI1 — SD Card  (arduino-pico SPI1 defaults, no explicit pin calls)
+//    D12  pin 16   MISO
+//    D13  pin 17   CS        (SD_CS,  software)
+//    D14  pin 19   SCK       (NOTE: also defined as TOUCH_CS in User_Setup — touch unused)
+//    D15  pin 20   MOSI
+//    D19  pin 25   Card Detect  (SD_CD, INPUT_PULLUP, LOW = card present)
+//
+//  MAX31855K — Thermocouple  (bit-bang, not hardware SPI)
+//    D5   pin  7   DO   (data out)
+//    D6   pin  9   CS
+//    D7   pin 10   CLK
+//
+//  Quadrature Encoder  (PIO0, state machine 0)
+//    D8   pin 11   Switch  (INPUT_PULLUP, interrupt RISING)
+//    D9   pin 12   A
+//    D10  pin 14   B
+//
+//  Outputs
+//    D4   pin  6   ESC / Blower  (Servo PWM)
+//    D11  pin 15   Relay
+//    D25  —        Onboard LED   (active HIGH)
+//
+//  Analogue
+//    A0/D26  pin 31   Potentiometer / spare ADC
+//
+//  Power
+//    pin 36   3V3 out
+//    pin 39   VSYS / VIN  (power in, 5 V recommended)
+//    pin 40   VBUS        (USB 5 V — not connected when powered via VIN)
+//
+// =============================================================================
+// FURNACE CONTROLLER — TUNABLE PARAMETERS
+// =============================================================================
+//
+// SETTINGS MENU (no recompile — adjust live via encoder):
+//   Smoothing α   0.1–1.0   Higher = faster TC response, lower = smoother
+//   TC Offset     ±10 °C    Calibration trim added to every reading
+//   Median window 1–128     Samples in noise-rejection filter; larger = smoother but slower
+//
+// PROFILE FILE  (profile.csv on SD card, one step per line):
+//   targetTemp             e.g.  200       heat to 200 °C then advance
+//   targetTemp,dwell_sec   e.g.  200,120   heat to 200 °C and hold 120 seconds
+//
+// CODE PARAMETERS (change below, then recompile):
+//   LEARN_TIMEOUT_MS          Max time for a heating step to reach target (30 min)
+//   LEARN_OVERSHOOT_TIMEOUT_MS Max time waiting for peak to drop 0.5 °C   ( 5 min)
+//   LEARN_SETTLING_TIMEOUT_MS  Max time waiting for temp to fall to target+1°C (15 min)
+//   LEARN_CUTOFF_BLEND        New-measurement weight in earlyCutoff average (0.0–1.0)
+//                             Lower = slower to update, more stable; higher = adapts faster
+//   DWELL_HYSTERESIS_C        Relay re-fires when temp drops this far below target during dwell
+//                             Smaller = tighter hold, more relay cycling
+//   LOG_INTERVAL_MS           How often data is appended to the SD log file
+//   DRAW_INTERVAL             Minimum ms between display redraws
+// =============================================================================
+
 #include "sScreen.h"
 #include <SPI.h>
 #include <Wire.h>
@@ -27,7 +94,10 @@ volatile bool swPressed = false;
 #define NUM_OPTIONS 4
 #define NUM_SETTINGS 7
 #define MAX_MEDIAN_WINDOW 128
-#define DRAW_INTERVAL 250
+#define DRAW_INTERVAL     250
+#define LOG_INTERVAL_MS   10000
+#define LEARN_CUTOFF_BLEND    0.3f   // weight of new measurement in earlyCutoff average
+#define DWELL_HYSTERESIS_C    2.0f   // relay re-fires when temp drops this far below target
 
 #include "Adafruit_MAX31855.h"
 #define MAXDO   5
@@ -52,7 +122,7 @@ int average = 0;
 
 File logFile;
 unsigned long lastLogTime = 0;
-const unsigned long logInterval = 10000;
+const unsigned long logInterval = LOG_INTERVAL_MS;
 char logFileName[20];
 bool loggingEnabled = false;
 bool readProfileEnabled = false;
@@ -98,6 +168,7 @@ bool rampHeating = true;
 
 // Dwell state
 bool dwelling = false;
+bool dwellIsHeating = false;
 unsigned long dwellStartTime = 0;
 
 // Learned thermal data per step
@@ -120,12 +191,15 @@ bool learnModeEnabled = false;
 bool learnModeActive = false;
 LearnPhase learnPhase = LEARN_IDLE;
 unsigned long learnStepStartTime = 0;
+unsigned long learnPhaseStartTime = 0;
 float learnPeakTemp = 0;
 unsigned long learnTargetCrossTime = 0;
 float learnPrevTemp = 0;
 unsigned long learnPrevTime = 0;
 float learnRateAtCutoff = 0;
-#define LEARN_TIMEOUT_MS 1800000UL
+#define LEARN_TIMEOUT_MS           1800000UL  // 30 min — heating phase
+#define LEARN_OVERSHOOT_TIMEOUT_MS  300000UL  //  5 min — overshoot phase
+#define LEARN_SETTLING_TIMEOUT_MS   900000UL  // 15 min — settling phase
 
 float currentTempC = 0;
 int currentInternalTemp = 0;
@@ -449,6 +523,7 @@ void loop() {
                 currentStep = 0;
                 startTemp = isnan(currentTempC) ? 25.0f : currentTempC;
                 learnStepStartTime = millis();
+                learnPhaseStartTime = millis();
                 learnPeakTemp = 0;
                 learnTargetCrossTime = 0;
                 learnRateAtCutoff = 0;
@@ -497,67 +572,76 @@ void loop() {
     float target = steps[currentStep].targetTemp;
     setpointTemp = target;
 
-    float cutoff = target;
-    if (learnedDataLoaded && currentStep < numLearned &&
-        learned[currentStep].targetTemp == target &&
-        learned[currentStep].earlyCutoff > 0) {
-      cutoff = target - learned[currentStep].earlyCutoff;
-    }
-
-    if (target >= currentTempC) {
-      if (rampHeating && currentTempC < cutoff) {
+    if (dwelling) {
+      // Dwell handling takes priority — direction of temperature travel doesn't matter
+      if (dwellIsHeating) {
+        // Maintain temperature with relay hysteresis: on below target-2, off at target
         escOn();
-        digitalWrite(relay, HIGH);
+        if (currentTempC < target - DWELL_HYSTERESIS_C)  digitalWrite(relay, HIGH);
+        else if (currentTempC >= target)                  digitalWrite(relay, LOW);
       } else {
-        rampHeating = false;
+        // Cooling step dwell — just wait, no heat or fan
         digitalWrite(relay, LOW);
-        escOn();
-        if (currentTempC <= target + 1.0f && currentTempC >= target - 1.0f) {
-          // Temperature reached — handle dwell or advance
-          if (steps[currentStep].dwellMs > 0 && !dwelling) {
-            dwelling = true;
-            dwellStartTime = millis();
-          } else if (dwelling && (millis() - dwellStartTime) >= steps[currentStep].dwellMs) {
-            dwelling = false;
-            currentStep++;
-            rampHeating = true;
-            if (currentStep >= numSteps) {
-              rampActive = false;
-              stopAllOutputs();
-            }
-          } else if (steps[currentStep].dwellMs == 0) {
-            currentStep++;
-            rampHeating = true;
-            if (currentStep >= numSteps) {
-              rampActive = false;
-              stopAllOutputs();
-            }
-          }
-          // During dwell on a heating step, keep esc HIGH (fan) to maintain temp
+        escOff();
+      }
+      if ((millis() - dwellStartTime) >= steps[currentStep].dwellMs) {
+        dwelling = false;
+        digitalWrite(relay, LOW);
+        currentStep++;
+        rampHeating = true;
+        if (currentStep >= numSteps) {
+          rampActive = false;
+          stopAllOutputs();
         }
       }
     } else {
-      digitalWrite(relay, LOW);
-      escOff();
-      if (currentTempC <= target + 1.0f) {
-        // Temperature reached — handle dwell or advance
-        if (steps[currentStep].dwellMs > 0 && !dwelling) {
-          dwelling = true;
-          dwellStartTime = millis();
-        } else if (dwelling && (millis() - dwellStartTime) >= steps[currentStep].dwellMs) {
-          dwelling = false;
-          currentStep++;
-          rampHeating = true;
-          if (currentStep >= numSteps) {
-            rampActive = false;
-            stopAllOutputs();
+      float cutoff = target;
+      if (learnedDataLoaded && currentStep < numLearned &&
+          learned[currentStep].targetTemp == target &&
+          learned[currentStep].earlyCutoff > 0) {
+        cutoff = target - learned[currentStep].earlyCutoff;
+      }
+
+      if (target >= currentTempC) {
+        // Heating step
+        if (rampHeating && currentTempC < cutoff) {
+          escOn();
+          digitalWrite(relay, HIGH);
+        } else {
+          rampHeating = false;
+          digitalWrite(relay, LOW);
+          escOn();
+          if (currentTempC <= target + 1.0f && currentTempC >= target - 1.0f) {
+            if (steps[currentStep].dwellMs > 0) {
+              dwelling = true;
+              dwellIsHeating = true;
+              dwellStartTime = millis();
+            } else {
+              currentStep++;
+              rampHeating = true;
+              if (currentStep >= numSteps) {
+                rampActive = false;
+                stopAllOutputs();
+              }
+            }
           }
-        } else if (steps[currentStep].dwellMs == 0) {
-          currentStep++;
-          rampHeating = true;
-          if (currentStep >= numSteps) {
-            rampActive = false;
-            stopAllOutputs();
+        }
+      } else {
+        // Cooling step
+        digitalWrite(relay, LOW);
+        escOff();
+        if (currentTempC <= target + 1.0f) {
+          if (steps[currentStep].dwellMs > 0) {
+            dwelling = true;
+            dwellIsHeating = false;
+            dwellStartTime = millis();
+          } else {
+            currentStep++;
+            rampHeating = true;
+            if (currentStep >= numSteps) {
+              rampActive = false;
+              stopAllOutputs();
+            }
           }
         }
       }
@@ -711,7 +795,11 @@ void loadSettings() {
   if (sscanf(buffer, "%f,%f,%d", &s, &o, &m) >= 2) {
     if (s >= 0.1f && s <= 1.0f) tcSmoothing = s;
     if (o >= -10.0f && o <= 10.0f) tcOffset = o;
-    if (m >= 1 && m <= MAX_MEDIAN_WINDOW) tcMedianWindow = m;
+    if (m >= 1 && m <= MAX_MEDIAN_WINDOW) {
+      tcMedianWindow = m;
+      tcBufferIdx = 0;
+      tcBufferCount = 0;
+    }
     Serial.print("Settings loaded: smoothing=");
     Serial.print(tcSmoothing);
     Serial.print(" offset=");
@@ -982,6 +1070,7 @@ float tickLearnMode() {
       stopAllOutputs();
     } else {
       learnStepStartTime = now;
+      learnPhaseStartTime = now;
       learnPeakTemp = 0;
       learnTargetCrossTime = 0;
       learnRateAtCutoff = 0;
@@ -1010,6 +1099,7 @@ float tickLearnMode() {
         learnPeakTemp = currentTempC;
         digitalWrite(relay, LOW);
         learnPhase = LEARN_OVERSHOOT;
+        learnPhaseStartTime = now;
         Serial.print("Step ");
         Serial.print(currentStep);
         Serial.print(" cutoff at ");
@@ -1025,23 +1115,68 @@ float tickLearnMode() {
       }
       if (currentTempC < learnPeakTemp - 0.5f) {
         learnPhase = LEARN_SETTLING;
+        learnPhaseStartTime = now;
         Serial.print("Step ");
         Serial.print(currentStep);
         Serial.print(" peak: ");
         Serial.println(learnPeakTemp);
+      } else if (now - learnPhaseStartTime > LEARN_OVERSHOOT_TIMEOUT_MS) {
+        // Overshoot too small to detect (< 0.5°C drop from peak) — record and advance
+        Serial.print("Step "); Serial.print(currentStep); Serial.println(" overshoot timeout");
+        float overshoot = learnPeakTemp - target;
+        float earlyCut = overshoot * 0.8f;
+        if (earlyCut < 0) earlyCut = 0;
+        if (currentStep < numLearned &&
+            learned[currentStep].targetTemp == target &&
+            learned[currentStep].earlyCutoff > 0) {
+          earlyCut = LEARN_CUTOFF_BLEND * earlyCut + (1.0f - LEARN_CUTOFF_BLEND) * learned[currentStep].earlyCutoff;
+        }
+        learned[currentStep].targetTemp = target;
+        learned[currentStep].prevSettledTemp = (currentStep == 0) ? startTemp : steps[currentStep - 1].targetTemp;
+        learned[currentStep].timeToReach = (learnTargetCrossTime - learnStepStartTime) / 1000.0f;
+        learned[currentStep].overshoot = overshoot;
+        learned[currentStep].settleTime = 0;
+        learned[currentStep].rateOfRise = learnRateAtCutoff;
+        learned[currentStep].earlyCutoff = earlyCut;
+        currentStep++;
+        if (currentStep >= numSteps) {
+          numLearned = numSteps;
+          saveLearnedData();
+          learnPhase = LEARN_COMPLETE;
+          learnModeActive = false;
+          stopAllOutputs();
+          Serial.println("Learn mode complete.");
+        } else {
+          learnStepStartTime = now;
+          learnPhaseStartTime = now;
+          learnPeakTemp = 0;
+          learnTargetCrossTime = 0;
+          learnRateAtCutoff = 0;
+          float nextTarget = steps[currentStep].targetTemp;
+          learnPhase = (nextTarget < currentTempC) ? LEARN_COOLING : LEARN_HEATING;
+        }
       }
       break;
 
     case LEARN_SETTLING:
       escOn();
       digitalWrite(relay, LOW);
-      if (currentTempC <= target + 1.0f) {
+      if (currentTempC <= target + 1.0f || now - learnPhaseStartTime > LEARN_SETTLING_TIMEOUT_MS) {
+        if (now - learnPhaseStartTime > LEARN_SETTLING_TIMEOUT_MS) {
+          Serial.print("Step "); Serial.print(currentStep); Serial.println(" settling timeout");
+        }
         float timeToReach = (learnTargetCrossTime - learnStepStartTime) / 1000.0f;
         float overshoot = learnPeakTemp - target;
         float settleTime = (now - learnTargetCrossTime) / 1000.0f;
         float prevSettled = (currentStep == 0) ? startTemp : steps[currentStep - 1].targetTemp;
         float earlyCut = overshoot * 0.8f;
         if (earlyCut < 0) earlyCut = 0;
+        // Blend with previous learned value to dampen oscillation between runs
+        if (currentStep < numLearned &&
+            learned[currentStep].targetTemp == target &&
+            learned[currentStep].earlyCutoff > 0) {
+          earlyCut = LEARN_CUTOFF_BLEND * earlyCut + (1.0f - LEARN_CUTOFF_BLEND) * learned[currentStep].earlyCutoff;
+        }
 
         learned[currentStep].targetTemp = target;
         learned[currentStep].prevSettledTemp = prevSettled;
@@ -1068,6 +1203,7 @@ float tickLearnMode() {
           Serial.println("Learn mode complete.");
         } else {
           learnStepStartTime = now;
+          learnPhaseStartTime = now;
           learnPeakTemp = 0;
           learnTargetCrossTime = 0;
           learnRateAtCutoff = 0;
@@ -1106,6 +1242,7 @@ float tickLearnMode() {
           Serial.println("Learn mode complete.");
         } else {
           learnStepStartTime = now;
+          learnPhaseStartTime = now;
           learnPeakTemp = 0;
           learnTargetCrossTime = 0;
           learnRateAtCutoff = 0;
