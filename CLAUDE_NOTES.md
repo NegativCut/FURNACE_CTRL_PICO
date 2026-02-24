@@ -1,12 +1,12 @@
 # furnace_ctrl_pico — Claude Session Notes
 
-Last updated: 2026-02-22
+Last updated: 2026-02-24
 
 ---
 
 ## Hardware Summary
 
-### Current — active working hardware (do not change until USB host proven)
+### Current — Phase 3 complete (SD removed, USB flash is sole storage)
 
 | Component | Arduino D / GPIO | Pico Pin |
 |---|---|---|
@@ -21,30 +21,18 @@ Last updated: 2026-02-22
 | Encoder A (PIO0) | D9 | 12 |
 | Encoder B (PIO0) | D10 | 14 |
 | Relay | D11 | 15 |
-| SD MISO (SPI1) | D12 | 16 |
-| SD CS (SPI1, software) | D13 | 17 |
-| SD SCK (SPI1) | D14 | 19 |  (also TOUCH_CS in User_Setup — touch unused)
-| SD MOSI (SPI1) | D15 | 20 |
-| SD Card Detect | D19 | 25 |
 | TFT CS | D20 | 26 |
 | TFT RST | D21 | 27 |
 | TFT DC | D22 | 29 |
 | Onboard LED | D25 | — |
 | Pot / spare ADC | A0/D26 | 31 |
-
-**Power:** 3V3 out = pin 36 · VSYS/VIN = pin 39 · VBUS = pin 40 (free when on VIN)
-
-### Planned additions — only after USB host proven on test hardware
-
-| Component | Arduino D / GPIO | Pico Pin |
-|---|---|---|
 | USB host D+ | D27 | 32 |
 | USB host D− | D28 | 34 |
 | PC VBUS detect (internal, no wiring) | GPIO24 | — |
 
-### Post USB-migration — only if USB host proven
-SD card socket removed. D12–D15, D19 freed. SPI1 dropped from firmware.
-No code or hardware changes to SD until USB host is working on a test build.
+**Power:** 3V3 out = pin 36 · VSYS/VIN = pin 39 · VBUS = pin 40
+
+SD card socket (D12–D15, D19) removed. SPI1 dropped from firmware.
 
 ---
 
@@ -55,11 +43,8 @@ No code or hardware changes to SD until USB host is working on a test build.
 - TFT config: `FIRMWARE/FURNACE_CTRL_PICO/User_Setup_pi_furnace.h`
 - Temperature pipeline: raw → +tcOffset → medianFilter (circular, 1–128) → EMA → `currentTempC`
 - 4 main menu options: Logging, Profile run, Learn mode, Settings
-- All storage on SD card: `settings.csv`, `profile.csv`, `learned.csv`, `log_N.csv`
-
-### Target (USB flash replaces SD entirely)
-- All storage moves to USB flash: `settings.csv`, `profile.csv`, `learned.csv`, `log_N.csv`
-- SD card hardware removed from design, SD.h and SPI1 dropped
+- All storage on USB flash drive: `settings.csv`, `profile.csv`, `learned.csv`, `log_N.csv`
+- SD.h and SPI1 removed (Phase 3 complete)
 - PC (micro-USB, device mode) and flash drive (USB-A on D27/D28, host mode) are **never concurrent**
 - GPIO24 detects PC presence on micro-USB (internal VBUS divider, no wiring needed)
 
@@ -255,3 +240,31 @@ Impact check:
 **Phase 5 — UI**
 - Replace SD status line with USB status (PC connected / Flash ready / USB: ---)
 - Remove SD-specific menu behaviour
+
+---
+
+## Lesson: USB mount callback pattern
+
+The correct mount/unmount pattern was established by the working test sketch
+(`FIRMWARE/USB_HOST_TEST/USB_HOST_TEST.ino`) and must not be deviated from
+without a concrete, observable reason.
+
+```cpp
+// Callback (Core 1 — called from USBHost.task())
+extern "C" void tuh_msc_mount_cb(uint8_t dev_addr) {
+  usbFlashMounted = true;               // always — drives display
+  if (msc_block_dev.begin(dev_addr)) {  // as in test sketch
+    usbFlashJustMounted = true;
+  }
+}
+
+// loop() (Core 0)
+if (usbFlashJustMounted) {
+  usbFlashJustMounted = false;
+  if (fatfs.begin(&msc_block_dev)) { ... }  // filesystem init here
+}
+```
+
+Rule: **read the working test sketch first; treat it as ground truth; match it.**
+Do not theorise about Core 0/Core 1 deadlocks or move `begin()` around without
+an observable failure (not a theory) as justification.

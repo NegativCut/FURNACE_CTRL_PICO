@@ -11,12 +11,7 @@
 //    D21  pin 27   RST
 //    D22  pin 29   DC
 //
-//  SPI1 — SD Card  (arduino-pico SPI1 defaults, no explicit pin calls)
-//    D12  pin 16   MISO
-//    D13  pin 17   CS        (SD_CS,  software)
-//    D14  pin 19   SCK       (NOTE: also defined as TOUCH_CS in User_Setup — touch unused)
-//    D15  pin 20   MOSI
-//    D19  pin 25   Card Detect  (SD_CD, INPUT_PULLUP, LOW = card present)
+//  SPI1 — removed (SD card replaced by USB flash drive)
 //
 //  MAX31855K — Thermocouple  (bit-bang, not hardware SPI)
 //    D5   pin  7   DO   (data out)
@@ -59,7 +54,7 @@
 //   TC Offset     ±10 °C    Calibration trim added to every reading
 //   Median window 1–128     Samples in noise-rejection filter; larger = smoother but slower
 //
-// PROFILE FILE  (profile.csv on SD card, one step per line):
+// PROFILE FILE  (profile.csv on USB flash drive, one step per line):
 //   targetTemp             e.g.  200       heat to 200 °C then advance
 //   targetTemp,dwell_sec   e.g.  200,120   heat to 200 °C and hold 120 seconds
 //
@@ -71,7 +66,7 @@
 //                             Lower = slower to update, more stable; higher = adapts faster
 //   DWELL_HYSTERESIS_C        Relay re-fires when temp drops this far below target during dwell
 //                             Smaller = tighter hold, more relay cycling
-//   LOG_INTERVAL_MS           How often data is appended to the SD log file
+//   LOG_INTERVAL_MS           How often data is appended to the USB log file
 //   DRAW_INTERVAL             Minimum ms between display redraws
 // =============================================================================
 
@@ -79,13 +74,13 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <TFT_eSPI.h>
-#include <SD.h>
 #include <Servo.h>
 Servo escServo;
 TFT_eSPI tft = TFT_eSPI();
 
 #include "hardware/clocks.h"
 #include "hardware/pio.h"
+#include "SdFat_Adafruit_Fork.h"  // MUST be before pio_usb.h and Adafruit_TinyUSB.h
 #include "pio_usb.h"            // must be before Adafruit_TinyUSB.h
 #include "Adafruit_TinyUSB.h"
 #include "quadrature.pio.h"
@@ -130,27 +125,24 @@ int readIndex = 0;
 int total = 0;
 int average = 0;
 
-#define SD_CS 13
-#define SD_CD 19
-
-// ── USB host scaffold (Phase 2 — additive, no SD code changed) ───────────────
+// ── USB host (Phase 3 — SD removed, all file I/O via FatVolume on USB flash) ──
 #define PIN_USB_HOST_DP  27     // D+; D− = DP+1 = D28
 #define PIN_VBUS_DETECT  24     // internal VBUS sense — HIGH = PC on micro-USB
 Adafruit_USBH_Host            USBHost;
+Adafruit_USBH_MSC_BlockDevice msc_block_dev;
+FatVolume                     fatfs;
 volatile bool usbFlashMounted       = false;
 volatile bool usbFlashJustMounted   = false;
 volatile bool usbFlashJustUnmounted = false;
 bool          pcConnected           = false;
+bool          usbFsReady            = false;   // FAT volume successfully mounted
 // ─────────────────────────────────────────────────────────────────────────────
 
-File logFile;
 unsigned long lastLogTime = 0;
 const unsigned long logInterval = LOG_INTERVAL_MS;
 char logFileName[20];
 bool loggingEnabled = false;
 bool readProfileEnabled = false;
-bool sdCardPresent = false;
-bool sdInitialized = false;
 int selectedOption = 0;
 
 // Settings
@@ -236,7 +228,6 @@ int32_t lastEncoderVal = 0;
 int lastSelectedOption = -1;
 bool lastLogging = false;
 bool lastProfile = false;
-bool lastSdPresent = false;
 bool lastUsbMounted = false;
 bool lastPcConnected = false;
 bool lastRampActive = false;
@@ -312,9 +303,6 @@ void setup() {
   pinMode(ledpin, OUTPUT);
   stopAllOutputs();
 
-  pinMode(SD_CD, INPUT_PULLUP);
-  checkSDCard();
-
   pinMode(PIN_VBUS_DETECT, INPUT);
   pcConnected = digitalRead(PIN_VBUS_DETECT);
   Serial.printf("[USB] PC: %s\n", pcConnected ? "connected" : "not connected");
@@ -348,7 +336,6 @@ void setup() {
   lastEncoderVal = encoder_value - 1;
   lastAverage = average - 1;
   lastInternalTemp = currentInternalTemp - 1;
-  lastSdPresent = !sdCardPresent;
   lastLogging = !loggingEnabled;
   lastProfile = !readProfileEnabled;
   lastLearnMode = !learnModeEnabled;
@@ -358,7 +345,6 @@ void setup() {
   drawMenu(0);
 
   // Sync after initial draw
-  lastSdPresent = sdCardPresent;
   lastSelectedOption = selectedOption;
   lastLogging = loggingEnabled;
   lastProfile = readProfileEnabled;
@@ -439,8 +425,6 @@ void loop() {
     }
   }
 
-  checkSDCard();
-
   // ── USB state poll ─────────────────────────────────────────
   bool pc = digitalRead(PIN_VBUS_DETECT);
   if (pc != pcConnected) {
@@ -450,10 +434,47 @@ void loop() {
   if (usbFlashJustMounted) {
     usbFlashJustMounted = false;
     Serial.println("[USB] Flash drive mounted");
+    if (fatfs.begin(&msc_block_dev)) {
+      usbFsReady = true;
+      Serial.println("[USB] FAT32 mounted");
+      loadSettings();
+      int fileCounter = 0;
+      snprintf(logFileName, sizeof(logFileName), "log_%d.csv", fileCounter);
+      while (fatfs.exists(logFileName)) {
+        fileCounter++;
+        snprintf(logFileName, sizeof(logFileName), "log_%d.csv", fileCounter);
+      }
+      File32 f;
+      if (f.open(&fatfs, logFileName, O_WRITE | O_CREAT | O_TRUNC)) {
+        Serial.print("[USB] Log: "); Serial.println(logFileName);
+        f.println("Timestamp,PotValue,EncoderValue,InternalTemp,ThermocoupleTemp,"
+                  "SetpointTemp,SSR_Esc,SSR_Relay,Step,LearnPhase,Dwelling");
+        f.close();
+      }
+      if (readProfileEnabled) {
+        readProfile();
+        loadLearnedData();
+        if (numSteps > 0 && !rampActive) {
+          currentStep = 0;
+          startTemp = isnan(currentTempC) ? 25.0f : currentTempC;
+          rampActive = true; rampHeating = true;
+        }
+      }
+    } else {
+      Serial.println("[USB] FAT32 mount failed — needs FAT32 formatted drive");
+      usbFsReady = false;
+    }
   }
   if (usbFlashJustUnmounted) {
     usbFlashJustUnmounted = false;
+    usbFsReady = false;
     Serial.println("[USB] Flash drive removed");
+    loggingEnabled = false;
+    readProfileEnabled = false;
+    rampActive = false;
+    dwelling = false;
+    freeProfile(); resetLearnState(); freeLearned();
+    stopAllOutputs();
   }
   // ───────────────────────────────────────────────────────────
 
@@ -473,11 +494,10 @@ void loop() {
         escOff();
         testRelay = false;
         stopAllOutputs();
-        if (sdCardPresent && sdInitialized) saveSettings();
+        if (usbFsReady) saveSettings();
         tft.fillScreen(TFT_BLACK);
         // Force full main menu redraw
         lastSelectedOption = -1;
-        lastSdPresent      = !sdCardPresent;
         lastUsbMounted     = !usbFlashMounted;
         lastPcConnected    = !pcConnected;
         lastLogging        = !loggingEnabled;
@@ -530,7 +550,7 @@ void loop() {
           learnModeEnabled = false;
           learnModeActive = false;
           learnPhase = LEARN_IDLE;
-          if (sdCardPresent) {
+          if (usbFsReady) {
             readProfile();
             loadLearnedData();
             if (numSteps > 0) {
@@ -555,7 +575,7 @@ void loop() {
         if (learnModeEnabled) {
           readProfileEnabled = false;
           rampActive = false;
-          if (sdCardPresent) {
+          if (usbFsReady) {
             readProfile();
             if (numSteps > 0) {
               loadLearnedData();
@@ -737,7 +757,6 @@ void loop() {
                        (learnModeEnabled != lastLearnMode) ||
                        (learnModeActive != lastLearnActive) ||
                        (learnPhase != lastLearnPhase) ||
-                       (sdCardPresent != lastSdPresent) ||
                        (usbFlashMounted != lastUsbMounted) ||
                        (pcConnected != lastPcConnected) ||
                        (rampActive != lastRampActive) ||
@@ -759,7 +778,6 @@ void loop() {
       lastLearnMode = learnModeEnabled;
       lastLearnActive = learnModeActive;
       lastLearnPhase = learnPhase;
-      lastSdPresent = sdCardPresent;
       lastUsbMounted = usbFlashMounted;
       lastPcConnected = pcConnected;
       lastRampActive = rampActive;
@@ -773,7 +791,7 @@ void loop() {
   delay(1);
 
   unsigned long currentTime = millis();
-  if (loggingEnabled && sdCardPresent && sdInitialized && (currentTime - lastLogTime >= logInterval)) {
+  if (loggingEnabled && usbFsReady && (currentTime - lastLogTime >= logInterval)) {
     logData(setpointTemp);
     lastLogTime = currentTime;
   }
@@ -828,8 +846,8 @@ void readPicoT() {
 }
 
 void loadSettings() {
-  File f = SD.open("settings.csv", FILE_READ);
-  if (!f) return;
+  File32 f;
+  if (!f.open(&fatfs, "settings.csv", O_RDONLY)) return;
 
   // Skip header
   while (f.available() && f.read() != '\n');
@@ -864,9 +882,9 @@ void loadSettings() {
 }
 
 void saveSettings() {
-  SD.remove("settings.csv");
-  File f = SD.open("settings.csv", FILE_WRITE);
-  if (!f) {
+  fatfs.remove("settings.csv");
+  File32 f;
+  if (!f.open(&fatfs, "settings.csv", O_WRITE | O_CREAT | O_TRUNC)) {
     Serial.println("Error saving settings");
     return;
   }
@@ -880,75 +898,13 @@ void saveSettings() {
   Serial.println("Settings saved.");
 }
 
-void checkSDCard() {
-  bool currentState = digitalRead(SD_CD) == LOW;
-  if (currentState != sdCardPresent) {
-    sdCardPresent = currentState;
-    if (sdCardPresent) {
-      Serial.println("SD card inserted. Initializing...");
-      SPI1.begin();
-      if (SD.begin(SD_CS, SPI1)) {
-        Serial.println("SD card initialized successfully.");
-        sdInitialized = true;
-
-        loadSettings();
-
-        int fileCounter = 0;
-        snprintf(logFileName, sizeof(logFileName), "log_%d.csv", fileCounter);
-        while (SD.exists(logFileName)) {
-          fileCounter++;
-          snprintf(logFileName, sizeof(logFileName), "log_%d.csv", fileCounter);
-        }
-
-        logFile = SD.open(logFileName, FILE_WRITE);
-        if (logFile) {
-          Serial.print("Created log file: ");
-          Serial.println(logFileName);
-          logFile.println("Timestamp,PotValue,EncoderValue,InternalTemp,ThermocoupleTemp,SetpointTemp,SSR_Esc,SSR_Relay,Step,LearnPhase,Dwelling");
-          logFile.close();
-        } else {
-          Serial.println("Error creating log file.");
-          sdInitialized = false;
-        }
-
-        if (readProfileEnabled) {
-          readProfile();
-          loadLearnedData();
-          if (numSteps > 0 && !rampActive) {
-            currentStep = 0;
-            startTemp = isnan(currentTempC) ? 25.0f : currentTempC;
-            rampActive = true;
-            rampHeating = true;
-          }
-        }
-      } else {
-        Serial.println("SD card initialization failed.");
-        sdInitialized = false;
-      }
-    } else {
-      Serial.println("SD card removed.");
-      SD.end();
-      SPI1.end();
-      sdInitialized = false;
-      loggingEnabled = false;
-      readProfileEnabled = false;
-      rampActive = false;
-      dwelling = false;
-      freeProfile();
-      resetLearnState();
-      freeLearned();
-      stopAllOutputs();
-    }
-  }
-}
-
 void readProfile() {
   free(steps);
   steps = NULL;
   numSteps = 0;
 
-  File profileFile = SD.open("profile.csv", FILE_READ);
-  if (!profileFile) {
+  File32 profileFile;
+  if (!profileFile.open(&fatfs, "profile.csv", O_RDONLY)) {
     Serial.println("Error opening profile.csv");
     readProfileEnabled = false;
     return;
@@ -984,7 +940,7 @@ void readProfile() {
     return;
   }
 
-  profileFile.seek(0);
+  profileFile.seekSet(0);
   while (profileFile.available() && numSteps < lineCount) {
     size_t index = 0;
     while (profileFile.available() && index < sizeof(buffer) - 1) {
@@ -1018,13 +974,13 @@ void readProfile() {
 void loadLearnedData() {
   freeLearned();
 
-  File f = SD.open("learned.csv", FILE_READ);
-  if (!f) return;
+  File32 f;
+  if (!f.open(&fatfs, "learned.csv", O_RDONLY)) return;
 
   while (f.available() && f.read() != '\n');
 
   int count = 0;
-  long dataStart = f.position();
+  long dataStart = f.curPosition();
   char buffer[120];
   while (f.available()) {
     size_t idx = 0;
@@ -1042,7 +998,7 @@ void loadLearnedData() {
   learned = (LearnedStep*)malloc(count * sizeof(LearnedStep));
   if (!learned) { f.close(); return; }
 
-  f.seek(dataStart);
+  f.seekSet(dataStart);
   while (f.available() && numLearned < count) {
     size_t idx = 0;
     while (f.available() && idx < sizeof(buffer) - 1) {
@@ -1068,9 +1024,9 @@ void loadLearnedData() {
 }
 
 void saveLearnedData() {
-  SD.remove("learned.csv");
-  File f = SD.open("learned.csv", FILE_WRITE);
-  if (!f) {
+  fatfs.remove("learned.csv");
+  File32 f;
+  if (!f.open(&fatfs, "learned.csv", O_WRITE | O_CREAT | O_TRUNC)) {
     Serial.println("Error saving learned data");
     return;
   }
@@ -1406,16 +1362,10 @@ void drawMenu(float setpointTemp) {
   tft.startWrite();
   tft.setTextSize(menuTextSize);
 
-  // Status flags row — SD / USB / PC  (redrawn only when any state changes)
-  if (sdCardPresent != lastSdPresent || usbFlashMounted != lastUsbMounted || pcConnected != lastPcConnected) {
-    uint16_t sdColor  = sdCardPresent   ? TFT_GREEN : TFT_DARKGREY;
+  // Status flags row — USB / PC  (redrawn only when any state changes)
+  if (usbFlashMounted != lastUsbMounted || pcConnected != lastPcConnected) {
     uint16_t usbColor = usbFlashMounted ? TFT_GREEN : TFT_DARKGREY;
     uint16_t pcColor  = pcConnected     ? TFT_GREEN : TFT_DARKGREY;
-
-    tft.fillRect(210, 5, 80, 22, sdColor);
-    tft.setTextColor(TFT_WHITE, sdColor);
-    tft.setCursor(232, 7);
-    tft.print(" SD");
 
     tft.fillRect(298, 5, 80, 22, usbColor);
     tft.setTextColor(TFT_WHITE, usbColor);
@@ -1528,44 +1478,43 @@ void drawMenu(float setpointTemp) {
 }
 
 void logData(float setpointTemp) {
-  logFile = SD.open(logFileName, FILE_WRITE);
-  if (logFile) {
+  File32 f;
+  if (f.open(&fatfs, logFileName, O_WRITE | O_CREAT | O_APPEND)) {
     unsigned long timestamp = millis();
-    logFile.print(timestamp);
-    logFile.print(",");
-    logFile.print(average);
-    logFile.print(",");
-    logFile.print(encoder_value);
-    logFile.print(",");
-    logFile.print(currentInternalTemp);
-    logFile.print(",");
-    if (isnan(currentTempC)) logFile.print(tc_str);
-    else logFile.print(currentTempC);
-    logFile.print(",");
-    logFile.print(setpointTemp);
-    logFile.print(",");
-    logFile.print(escServo.attached() ? 1 : 0);
-    logFile.print(",");
-    logFile.print(digitalRead(relay));
-    logFile.print(",");
+    f.print(timestamp);
+    f.print(",");
+    f.print(average);
+    f.print(",");
+    f.print(encoder_value);
+    f.print(",");
+    f.print(currentInternalTemp);
+    f.print(",");
+    if (isnan(currentTempC)) f.print(tc_str);
+    else f.print(currentTempC);
+    f.print(",");
+    f.print(setpointTemp);
+    f.print(",");
+    f.print(escServo.attached() ? 1 : 0);
+    f.print(",");
+    f.print(digitalRead(relay));
+    f.print(",");
     int logStep = (rampActive || learnModeActive) ? (currentStep + 1) : 0;
-    logFile.print(logStep);
-    logFile.print(",");
-    logFile.print((int)learnPhase);
-    logFile.print(",");
-    logFile.print(dwelling ? 1 : 0);
-    logFile.println();
-    logFile.close();
+    f.print(logStep);
+    f.print(",");
+    f.print((int)learnPhase);
+    f.print(",");
+    f.print(dwelling ? 1 : 0);
+    f.println();
+    f.close();
   } else {
     Serial.println("Error opening log file.");
   }
 }
 
 // ============================================================
-// CORE 1 — PIO USB host scaffold (Phase 2, additive only)
-// Note: pio1 used here; pio0 is reserved for quadrature encoder.
-// SdFat_Adafruit_Fork.h is NOT included yet — no file I/O via USB
-// until Phase 3 (storage refactor, SD card removed).
+// CORE 1 — PIO USB host (Phase 3 — SD removed, USB flash is sole storage)
+// pio1 used here; pio0 is reserved for quadrature encoder.
+// File I/O via SdFat FatVolume/File32 on msc_block_dev (USB MSC).
 // ============================================================
 
 void setup1() {
@@ -1582,9 +1531,10 @@ void loop1() {
 }
 
 extern "C" void tuh_msc_mount_cb(uint8_t dev_addr) {
-  (void) dev_addr;
-  usbFlashMounted     = true;
-  usbFlashJustMounted = true;
+  usbFlashMounted = true;                    // always — display goes green regardless
+  if (msc_block_dev.begin(dev_addr)) {       // same as working test sketch
+    usbFlashJustMounted = true;
+  }
 }
 
 extern "C" void tuh_msc_umount_cb(uint8_t dev_addr) {
