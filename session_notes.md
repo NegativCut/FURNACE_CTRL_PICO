@@ -1,10 +1,14 @@
 # furnace_ctrl_pico — Session Notes
 
-Last updated: 2026-02-25
+Last updated: 2026-02-25 — Phase 3 fully tested and working
 
 ---
 
-## Session 2026-02-25 — Phase 3: USB Storage Migration (complete, tested, working)
+## Session 2026-02-25 — Phase 3: USB Storage Migration (complete, fully tested)
+
+Tested and confirmed working: hot-plug, unplug, re-plug display flags; logging;
+profile run; learn mode. All file I/O (settings, profile, learned, log) confirmed
+on USB flash drive.
 
 ### What was done
 Removed the SD card entirely and migrated all file I/O to a USB flash drive via
