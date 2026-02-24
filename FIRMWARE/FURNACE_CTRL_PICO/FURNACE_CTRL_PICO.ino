@@ -42,7 +42,8 @@
 //    VBUS pin 40   5V  ── 500mA polyfuse ── USB-A pin 1
 //    GND           GND ─────────────────── USB-A pin 4
 //    GPIO24 (internal VBUS sense) — HIGH = PC connected to micro-USB
-//    NOTE: PC (micro-USB) and flash drive are never connected simultaneously
+//    NOTE: in normal standalone operation PC and flash drive are not used at
+//    the same time — during bench testing both may be connected
 //
 //  Power
 //    pin 36   3V3 out
@@ -351,6 +352,8 @@ void setup() {
   lastLogging = !loggingEnabled;
   lastProfile = !readProfileEnabled;
   lastLearnMode = !learnModeEnabled;
+  lastUsbMounted = !usbFlashMounted;
+  lastPcConnected = !pcConnected;
 
   drawMenu(0);
 
@@ -474,17 +477,19 @@ void loop() {
         tft.fillScreen(TFT_BLACK);
         // Force full main menu redraw
         lastSelectedOption = -1;
-        lastSdPresent = !sdCardPresent;
-        lastLogging = !loggingEnabled;
-        lastProfile = !readProfileEnabled;
-        lastLearnMode = !learnModeEnabled;
-        lastRampActive = !rampActive;
-        lastLearnActive = !learnModeActive;
-        lastCurrentStep = -1;
+        lastSdPresent      = !sdCardPresent;
+        lastUsbMounted     = !usbFlashMounted;
+        lastPcConnected    = !pcConnected;
+        lastLogging        = !loggingEnabled;
+        lastProfile        = !readProfileEnabled;
+        lastLearnMode      = !learnModeEnabled;
+        lastRampActive     = !rampActive;
+        lastLearnActive    = !learnModeActive;
+        lastCurrentStep    = -1;
         strcpy(lastTcStr, "~");
-        lastAverage = average - 1;
-        lastInternalTemp = currentInternalTemp - 1;
-        lastEncoderVal = encoder_value - 1;
+        lastAverage        = average - 1;
+        lastInternalTemp   = currentInternalTemp - 1;
+        lastEncoderVal     = encoder_value - 1;
       } else if (settingsItem == 3) {
         // Toggle ESC on/off
         testEscOn = !testEscOn;
@@ -1401,13 +1406,26 @@ void drawMenu(float setpointTemp) {
   tft.startWrite();
   tft.setTextSize(menuTextSize);
 
-  // SD status and USB status (y=13)
-  if (sdCardPresent != lastSdPresent) {
-    drawPaddedStr(11, 13, sdCardPresent ? "SD: Present" : "SD: Not Present", 20, textColour, TFT_BLACK);
-  }
-  if (usbFlashMounted != lastUsbMounted || pcConnected != lastPcConnected) {
-    const char* usbStr = pcConnected ? "PC: conn" : (usbFlashMounted ? "USB: mnt" : "USB: ---");
-    drawPaddedStr(260, 13, usbStr, 12, textColour, TFT_BLACK);
+  // Status flags row — SD / USB / PC  (redrawn only when any state changes)
+  if (sdCardPresent != lastSdPresent || usbFlashMounted != lastUsbMounted || pcConnected != lastPcConnected) {
+    uint16_t sdColor  = sdCardPresent   ? TFT_GREEN : TFT_DARKGREY;
+    uint16_t usbColor = usbFlashMounted ? TFT_GREEN : TFT_DARKGREY;
+    uint16_t pcColor  = pcConnected     ? TFT_GREEN : TFT_DARKGREY;
+
+    tft.fillRect(210, 5, 80, 22, sdColor);
+    tft.setTextColor(TFT_WHITE, sdColor);
+    tft.setCursor(232, 7);
+    tft.print(" SD");
+
+    tft.fillRect(298, 5, 80, 22, usbColor);
+    tft.setTextColor(TFT_WHITE, usbColor);
+    tft.setCursor(320, 7);
+    tft.print("USB");
+
+    tft.fillRect(386, 5, 80, 22, pcColor);
+    tft.setTextColor(TFT_WHITE, pcColor);
+    tft.setCursor(408, 7);
+    tft.print(" PC");
   }
 
   // Logging option (y=35)
