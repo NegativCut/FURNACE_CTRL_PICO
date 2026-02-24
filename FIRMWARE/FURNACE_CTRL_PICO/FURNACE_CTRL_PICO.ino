@@ -1,3 +1,4 @@
+
 // =============================================================================
 // ELECTRICAL CONNECTIONS  (Arduino D-number / Pico physical pin)
 // =============================================================================
@@ -35,10 +36,18 @@
 //  Analogue
 //    A0/D26  pin 31   Potentiometer / spare ADC
 //
+//  USB Host (USB-A socket — flash drive, always host mode)
+//    D27  pin 32   D+  ── 22Ω ── USB-A pin 3
+//    D28  pin 34   D−  ── 22Ω ── USB-A pin 2   (D− is always DP+1)
+//    VBUS pin 40   5V  ── 500mA polyfuse ── USB-A pin 1
+//    GND           GND ─────────────────── USB-A pin 4
+//    GPIO24 (internal VBUS sense) — HIGH = PC connected to micro-USB
+//    NOTE: PC (micro-USB) and flash drive are never connected simultaneously
+//
 //  Power
 //    pin 36   3V3 out
 //    pin 39   VSYS / VIN  (power in, 5 V recommended)
-//    pin 40   VBUS        (USB 5 V — not connected when powered via VIN)
+//    pin 40   VBUS        (USB 5 V — free when powered via VIN)
 //
 // =============================================================================
 // FURNACE CONTROLLER — TUNABLE PARAMETERS
@@ -74,7 +83,10 @@
 Servo escServo;
 TFT_eSPI tft = TFT_eSPI();
 
+#include "hardware/clocks.h"
 #include "hardware/pio.h"
+#include "pio_usb.h"            // must be before Adafruit_TinyUSB.h
+#include "Adafruit_TinyUSB.h"
 #include "quadrature.pio.h"
 #define QUADRATURE_A_PIN 9
 #define QUADRATURE_B_PIN 10
@@ -119,6 +131,16 @@ int average = 0;
 
 #define SD_CS 13
 #define SD_CD 19
+
+// ── USB host scaffold (Phase 2 — additive, no SD code changed) ───────────────
+#define PIN_USB_HOST_DP  27     // D+; D− = DP+1 = D28
+#define PIN_VBUS_DETECT  24     // internal VBUS sense — HIGH = PC on micro-USB
+Adafruit_USBH_Host            USBHost;
+volatile bool usbFlashMounted       = false;
+volatile bool usbFlashJustMounted   = false;
+volatile bool usbFlashJustUnmounted = false;
+bool          pcConnected           = false;
+// ─────────────────────────────────────────────────────────────────────────────
 
 File logFile;
 unsigned long lastLogTime = 0;
@@ -214,6 +236,8 @@ int lastSelectedOption = -1;
 bool lastLogging = false;
 bool lastProfile = false;
 bool lastSdPresent = false;
+bool lastUsbMounted = false;
+bool lastPcConnected = false;
 bool lastRampActive = false;
 bool lastLearnMode = false;
 bool lastLearnActive = false;
@@ -271,6 +295,7 @@ float medianFilter(float newVal) {
 }
 
 void setup() {
+  set_sys_clock_khz(120000, true);  // PIO USB requires 120 or 240 MHz (default 125 will not work)
   Serial.begin(115200);
   pinMode(8, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(8), reSw, RISING);
@@ -288,6 +313,10 @@ void setup() {
 
   pinMode(SD_CD, INPUT_PULLUP);
   checkSDCard();
+
+  pinMode(PIN_VBUS_DETECT, INPUT);
+  pcConnected = digitalRead(PIN_VBUS_DETECT);
+  Serial.printf("[USB] PC: %s\n", pcConnected ? "connected" : "not connected");
 
   analogReadResolution(12);
 
@@ -408,6 +437,22 @@ void loop() {
   }
 
   checkSDCard();
+
+  // ── USB state poll ─────────────────────────────────────────
+  bool pc = digitalRead(PIN_VBUS_DETECT);
+  if (pc != pcConnected) {
+    pcConnected = pc;
+    Serial.printf("[USB] PC: %s\n", pc ? "connected" : "disconnected");
+  }
+  if (usbFlashJustMounted) {
+    usbFlashJustMounted = false;
+    Serial.println("[USB] Flash drive mounted");
+  }
+  if (usbFlashJustUnmounted) {
+    usbFlashJustUnmounted = false;
+    Serial.println("[USB] Flash drive removed");
+  }
+  // ───────────────────────────────────────────────────────────
 
   noInterrupts();
   bool pressed = swPressed;
@@ -688,6 +733,8 @@ void loop() {
                        (learnModeActive != lastLearnActive) ||
                        (learnPhase != lastLearnPhase) ||
                        (sdCardPresent != lastSdPresent) ||
+                       (usbFlashMounted != lastUsbMounted) ||
+                       (pcConnected != lastPcConnected) ||
                        (rampActive != lastRampActive) ||
                        (dwelling != lastDwelling) ||
                        (dwelling) ||  // redraw during dwell for countdown
@@ -708,6 +755,8 @@ void loop() {
       lastLearnActive = learnModeActive;
       lastLearnPhase = learnPhase;
       lastSdPresent = sdCardPresent;
+      lastUsbMounted = usbFlashMounted;
+      lastPcConnected = pcConnected;
       lastRampActive = rampActive;
       lastDwelling = dwelling;
       lastCurrentStep = currentStep;
@@ -1352,9 +1401,13 @@ void drawMenu(float setpointTemp) {
   tft.startWrite();
   tft.setTextSize(menuTextSize);
 
-  // SD status (y=10)
+  // SD status and USB status (y=13)
   if (sdCardPresent != lastSdPresent) {
     drawPaddedStr(11, 13, sdCardPresent ? "SD: Present" : "SD: Not Present", 20, textColour, TFT_BLACK);
+  }
+  if (usbFlashMounted != lastUsbMounted || pcConnected != lastPcConnected) {
+    const char* usbStr = pcConnected ? "PC: conn" : (usbFlashMounted ? "USB: mnt" : "USB: ---");
+    drawPaddedStr(260, 13, usbStr, 12, textColour, TFT_BLACK);
   }
 
   // Logging option (y=35)
@@ -1488,4 +1541,36 @@ void logData(float setpointTemp) {
   } else {
     Serial.println("Error opening log file.");
   }
+}
+
+// ============================================================
+// CORE 1 — PIO USB host scaffold (Phase 2, additive only)
+// Note: pio1 used here; pio0 is reserved for quadrature encoder.
+// SdFat_Adafruit_Fork.h is NOT included yet — no file I/O via USB
+// until Phase 3 (storage refactor, SD card removed).
+// ============================================================
+
+void setup1() {
+  pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
+  pio_cfg.pin_dp     = PIN_USB_HOST_DP;
+  pio_cfg.pio_rx_num = 1;   // pio1 — pio0 reserved for encoder
+  pio_cfg.pio_tx_num = 1;
+  USBHost.configure_pio_usb(1, &pio_cfg);
+  USBHost.begin(1);
+}
+
+void loop1() {
+  USBHost.task();
+}
+
+extern "C" void tuh_msc_mount_cb(uint8_t dev_addr) {
+  (void) dev_addr;
+  usbFlashMounted     = true;
+  usbFlashJustMounted = true;
+}
+
+extern "C" void tuh_msc_umount_cb(uint8_t dev_addr) {
+  (void) dev_addr;
+  usbFlashMounted       = false;
+  usbFlashJustUnmounted = true;
 }
