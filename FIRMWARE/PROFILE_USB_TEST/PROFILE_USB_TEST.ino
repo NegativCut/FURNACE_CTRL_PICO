@@ -1,9 +1,8 @@
 // =============================================================================
 // PROFILE_USB_TEST.ino
 //
-// Standalone integration test — USB host + profile CSV read/write + encoder.
-// Proves these subsystems work together before wiring them into the main sketch.
-// No thermocouple, no relay, no ESC, no EEPROM, no learn mode.
+// Standalone integration test — USB host + EEPROM + profile CSV + encoder.
+// No thermocouple, relay, ESC, or learn mode.
 //
 // Hardware (same pins as furnace controller):
 //   TFT ILI9486 480×320   SPI0: MISO=0, MOSI=3, SCLK=2, CS=20, DC=22, RST=21
@@ -11,14 +10,22 @@
 //   Encoder button         D8  (INPUT_PULLUP, interrupt RISING)
 //   USB-A host             PIO1: D+=D27, D-=D28 (22Ω series), VBUS via polyfuse
 //
-// Encoder: rotate to move menu cursor, press to run selected action.
+// Menu (rotate to scroll, press to run):
+//   Write test CSV     — write 5-step hard-coded profile to profile.csv on USB
+//   Read  profile.csv  — read profile.csv from USB into memory
+//   Clear loaded data  — discard in-memory steps
+//   Save EEPROM slot 1 — write in-memory steps to EEPROM slot 0
+//   Load EEPROM slot 1 — read EEPROM slot 0 into memory
+//   Save EEPROM slot 2 — write in-memory steps to EEPROM slot 1
+//   Load EEPROM slot 2 — read EEPROM slot 1 into memory
 //
-// Menu actions:
-//   Write CSV   — write a hard-coded 5-step test profile to profile.csv
-//   Read CSV    — read profile.csv and show loaded steps on-screen
-//   Clear       — discard loaded steps, reset display
+// EEPROM.commit() is NEVER called directly.  commitEEPROMSafe() first asks
+// Core 1 to park in a spin loop (interrupts enabled, not inside TinyUSB),
+// then calls EEPROM.commit(), then releases Core 1.  This prevents the
+// multicore-lockout deadlock that occurs when Core 1 is inside a USB
+// critical section.
 //
-// Serial output (115200) shows every operation and result.
+// Serial (115200) logs every encoder tick, button press, and file operation.
 // =============================================================================
 
 #include <SPI.h>
@@ -29,6 +36,7 @@
 #include "pio_usb.h"
 #include "Adafruit_TinyUSB.h"
 #include "quadrature.pio.h"
+#include <EEPROM.h>
 
 TFT_eSPI tft = TFT_eSPI();
 
@@ -37,9 +45,9 @@ TFT_eSPI tft = TFT_eSPI();
 #define ENC_B  10
 #define ENC_SW 8
 
-PIO  enc_pio    = pio0;
-uint enc_offset = 0;
-uint enc_sm     = 0;
+PIO  enc_pio     = pio0;
+uint enc_offset  = 0;
+uint enc_sm      = 0;
 int32_t enc_raw_last = 0;
 volatile bool btnPressed = false;
 
@@ -59,8 +67,8 @@ FatVolume                     fatfs;
 
 volatile bool usbJustMounted   = false;
 volatile bool usbJustUnmounted = false;
-volatile bool usbMounted       = false;  // display flag — set unconditionally in callback
-bool          usbFsReady       = false;  // FAT volume is mounted and usable
+volatile bool usbMounted       = false;   // set unconditionally in mount callback
+bool          usbFsReady       = false;   // FAT volume open and usable
 
 extern "C" void tuh_msc_mount_cb(uint8_t dev_addr) {
   usbMounted = true;
@@ -73,114 +81,210 @@ extern "C" void tuh_msc_umount_cb(uint8_t dev_addr) {
   usbJustUnmounted = true;
 }
 
-// ── Profile data (in-memory) ─────────────────────────────────────────────────
-#define MAX_STEPS 10
+// ── Core 1 pause / safe EEPROM commit ────────────────────────────────────────
+// EEPROM.commit() calls multicore_lockout_start_blocking() which deadlocks if
+// Core 1 is inside a TinyUSB critical section with interrupts disabled.
+// commitEEPROMSafe() waits for Core 1 to park in a spin loop first.
+volatile bool core1Ready        = false;
+volatile bool core1PauseRequest = false;
+volatile bool core1PauseAck     = false;
+bool          pendingEEPROMCommit = false;  // set from setup(); never from loop()
 
-struct Step {
-  float    temp;
-  uint32_t dwellMs;
+void commitEEPROMSafe() {
+  // Block until loop1() is running (setup1 / USB init is complete)
+  while (!core1Ready) { tight_loop_contents(); }
+  // Ask Core 1 to stop calling USBHost.task() and spin with interrupts enabled
+  core1PauseRequest = true;
+  while (!core1PauseAck) { tight_loop_contents(); }
+  // Core 1 is now idle — multicore lockout in EEPROM.commit() works cleanly
+  EEPROM.commit();
+  // Release Core 1
+  core1PauseRequest = false;
+  while (core1PauseAck) { tight_loop_contents(); }
+  Serial.println("[EE] committed");
+}
+
+// ── EEPROM layout ─────────────────────────────────────────────────────────────
+// Total: 2 + 2×(1 + 10×8) = 164 bytes  →  EEPROM.begin(256)
+#define EE_MAGIC  0xBE03
+#define EE_SLOTS  2
+#define EE_STEPS  10
+
+struct __attribute__((packed)) EEStep {
+  float    temp;     // 4 bytes
+  uint32_t dwellMs;  // 4 bytes
 };
+
+struct __attribute__((packed)) EESlot {
+  uint8_t numSteps;          // 0 = empty; >EE_STEPS = treat as corrupt
+  EEStep  steps[EE_STEPS];
+};
+
+struct __attribute__((packed)) EEData {
+  uint16_t magic;
+  EESlot   slots[EE_SLOTS];
+};
+
+EEData eedata;
+
+void initEEPROM() {
+  EEPROM.begin(256);
+  EEPROM.get(0, eedata);
+  if (eedata.magic != EE_MAGIC) {
+    Serial.println("[EE] uninitialised — writing defaults");
+    eedata.magic = EE_MAGIC;
+    for (int s = 0; s < EE_SLOTS; s++) eedata.slots[s].numSteps = 0;
+    EEPROM.put(0, eedata);
+    pendingEEPROMCommit = true;  // deferred: Core 1 not running yet
+  } else {
+    Serial.println("[EE] loaded from flash:");
+    for (int s = 0; s < EE_SLOTS; s++) {
+      uint8_t n = eedata.slots[s].numSteps;
+      if (n == 0 || n > EE_STEPS)
+        Serial.printf("  slot %d: %s\n", s + 1, n == 0 ? "empty" : "corrupt");
+      else
+        Serial.printf("  slot %d: %d steps\n", s + 1, n);
+    }
+  }
+}
+
+// ── In-memory profile ────────────────────────────────────────────────────────
+#define MAX_STEPS EE_STEPS
+
+struct Step { float temp; uint32_t dwellMs; };
 
 Step loadedSteps[MAX_STEPS];
 int  loadedCount = 0;
 
-// Hard-coded test profile written by "Write CSV"
+// Hard-coded test profile for "Write test CSV"
 static const float    TEST_TEMPS[]  = { 100, 200, 350, 500, 200 };
-static const uint32_t TEST_DWELLS[] = { 30, 60, 0, 120, 0 };  // seconds
+static const uint32_t TEST_DWELLS[] = {  30,  60,   0, 120,   0 };  // seconds
 #define N_TEST_STEPS 5
 
-// ── Display state ─────────────────────────────────────────────────────────────
-#define NUM_ITEMS 3
+// ── Menu ─────────────────────────────────────────────────────────────────────
+#define NUM_ITEMS 7
 const char* MENU[NUM_ITEMS] = {
   "Write test CSV",
   "Read  profile.csv",
   "Clear loaded data",
+  "Save EEPROM slot 1",
+  "Load EEPROM slot 1",
+  "Save EEPROM slot 2",
+  "Load EEPROM slot 2",
 };
 
-int  menuSel     = 0;
-int  lastMenuSel = -1;
-bool lastUsbReady       = false;
-bool lastUsbMounted     = false;
-int  lastLoadedCount    = -1;
-bool fullRedrawPending  = true;
+int  menuSel          = 0;
+int  lastMenuSel      = -1;
+bool fullRedrawPending = true;
 
-char statusLine[80] = "Insert USB flash drive";
+char statusLine[80]     = "Ready";
 char lastStatusLine[80] = "";
 
-// ── Draw helpers ─────────────────────────────────────────────────────────────
+// ── Display layout constants ──────────────────────────────────────────────────
+// Title:  y=3
+// Menu:   y=26..207  (7 rows × 26 px each, textSize 2 = 16 px tall)
+// Sep:    y=210
+// Status: y=214  (textSize 1)
+// EE:     y=226 + 236  (two lines, one per slot)
+// Loaded: y=250  (one summary line)
+// Hint:   y=308
+#define MENU_Y0  26
+#define MENU_H   26
+#define SEP_Y   210
+#define STAT_Y  214
+#define EE1_Y   226
+#define EE2_Y   236
+#define LOAD_Y  250
+#define HINT_Y  308
+
+void drawEESlotLine(int slot, int y) {
+  tft.fillRect(0, y, 480, 9, TFT_BLACK);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.setCursor(10, y);
+  uint8_t n = eedata.slots[slot].numSteps;
+  if (n == 0) {
+    tft.printf("EEPROM slot %d: empty", slot + 1);
+  } else if (n > EE_STEPS) {
+    tft.printf("EEPROM slot %d: CORRUPT (n=%d)", slot + 1, n);
+  } else {
+    tft.printf("EEPROM slot %d: %d steps  (", slot + 1, n);
+    for (int i = 0; i < n; i++) {
+      tft.printf("%.0f", eedata.slots[slot].steps[i].temp);
+      if (i < n - 1) tft.print(" ");
+    }
+    tft.print("C)");
+  }
+}
+
+void drawLoadedLine() {
+  tft.fillRect(0, LOAD_Y, 480, 9, TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(10, LOAD_Y);
+  if (loadedCount == 0) {
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.print("In-memory: empty");
+  } else {
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.printf("In-memory: %d steps  (", loadedCount);
+    for (int i = 0; i < loadedCount; i++) {
+      tft.printf("%.0f", loadedSteps[i].temp);
+      if (loadedSteps[i].dwellMs) tft.print("d");
+      if (i < loadedCount - 1) tft.print(" ");
+    }
+    tft.print("C)");
+  }
+}
+
 void drawAll() {
   tft.fillScreen(TFT_BLACK);
 
-  // Title bar
+  // Title
   tft.setTextSize(2);
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.setCursor(10, 6);
-  tft.print("PROFILE USB TEST");
+  tft.setCursor(10, 3);
+  tft.print("PROFILE + EEPROM TEST");
 
-  // USB status chip
+  // USB chip (top right)
   uint16_t usbCol = usbFsReady ? TFT_GREEN : (usbMounted ? TFT_ORANGE : TFT_DARKGREY);
-  tft.fillRect(340, 4, 130, 20, usbCol);
+  tft.fillRect(352, 2, 120, 18, usbCol);
   tft.setTextSize(1);
   tft.setTextColor(TFT_BLACK, usbCol);
-  tft.setCursor(346, 9);
+  tft.setCursor(356, 7);
   tft.print(usbFsReady ? "USB: ready  " : (usbMounted ? "USB: mounted" : "USB: absent "));
 
-  // Menu items
+  // Menu
   tft.setTextSize(2);
   for (int i = 0; i < NUM_ITEMS; i++) {
     uint16_t bg = (i == menuSel) ? TFT_BLUE : TFT_BLACK;
-    tft.fillRect(8, 36 + i * 32, 464, 24, bg);
+    tft.fillRect(8, MENU_Y0 + i * MENU_H, 464, MENU_H - 2, bg);
     tft.setTextColor(TFT_WHITE, bg);
-    tft.setCursor(12, 38 + i * 32);
+    tft.setCursor(12, MENU_Y0 + i * MENU_H);
     tft.print(MENU[i]);
   }
 
-  // Separator
-  tft.drawFastHLine(0, 136, 480, TFT_DARKGREY);
+  tft.drawFastHLine(0, SEP_Y, 480, TFT_DARKGREY);
 
-  // Status line
+  // Status
   tft.setTextSize(1);
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.setCursor(10, 142);
+  tft.setCursor(10, STAT_Y);
   tft.print(statusLine);
 
-  // Loaded profile steps
-  tft.drawFastHLine(0, 155, 480, TFT_DARKGREY);
-  if (loadedCount == 0) {
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.setCursor(10, 163);
-    tft.print("No profile loaded");
-  } else {
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setCursor(10, 159);
-    tft.printf("%d steps loaded:", loadedCount);
-    for (int i = 0; i < loadedCount && i < 9; i++) {
-      tft.setTextColor(i < loadedCount ? TFT_WHITE : TFT_DARKGREY, TFT_BLACK);
-      tft.setCursor(10, 170 + i * 15);
-      if (loadedSteps[i].dwellMs > 0) {
-        tft.printf("  Step %d: %.0f C   dwell %lu s", i + 1,
-                   loadedSteps[i].temp, loadedSteps[i].dwellMs / 1000UL);
-      } else {
-        tft.printf("  Step %d: %.0f C", i + 1, loadedSteps[i].temp);
-      }
-    }
-    if (loadedCount > 9) {
-      tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-      tft.setCursor(10, 170 + 9 * 15);
-      tft.printf("  ... (%d more)", loadedCount - 9);
-    }
-  }
+  // EEPROM slot summaries
+  tft.setTextSize(1);
+  drawEESlotLine(0, EE1_Y);
+  drawEESlotLine(1, EE2_Y);
 
-  // Hint bar
+  // In-memory summary
+  drawLoadedLine();
+
+  // Hint
   tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.setCursor(10, 308);
-  tft.print("Rotate: move cursor   Press: run action");
+  tft.setCursor(10, HINT_Y);
+  tft.print("Rotate: navigate   Press: run action");
 
   // Sync tracking
-  lastMenuSel     = menuSel;
-  lastUsbReady    = usbFsReady;
-  lastUsbMounted  = usbMounted;
-  lastLoadedCount = loadedCount;
+  lastMenuSel = menuSel;
   strcpy(lastStatusLine, statusLine);
   fullRedrawPending = false;
 }
@@ -189,9 +293,9 @@ void drawMenuOnly() {
   tft.setTextSize(2);
   for (int i = 0; i < NUM_ITEMS; i++) {
     uint16_t bg = (i == menuSel) ? TFT_BLUE : TFT_BLACK;
-    tft.fillRect(8, 36 + i * 32, 464, 24, bg);
+    tft.fillRect(8, MENU_Y0 + i * MENU_H, 464, MENU_H - 2, bg);
     tft.setTextColor(TFT_WHITE, bg);
-    tft.setCursor(12, 38 + i * 32);
+    tft.setCursor(12, MENU_Y0 + i * MENU_H);
     tft.print(MENU[i]);
   }
   lastMenuSel = menuSel;
@@ -199,9 +303,9 @@ void drawMenuOnly() {
 
 void drawStatus() {
   tft.setTextSize(1);
-  tft.fillRect(0, 138, 480, 16, TFT_BLACK);
+  tft.fillRect(0, STAT_Y, 480, 10, TFT_BLACK);
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.setCursor(10, 142);
+  tft.setCursor(10, STAT_Y);
   tft.print(statusLine);
   strcpy(lastStatusLine, statusLine);
 }
@@ -209,55 +313,34 @@ void drawStatus() {
 // ── Actions ──────────────────────────────────────────────────────────────────
 void doWriteCSV() {
   if (!usbFsReady) {
-    snprintf(statusLine, sizeof(statusLine), "FAIL: no USB flash ready");
-    fullRedrawPending = true;
-    Serial.println(statusLine);
-    return;
+    snprintf(statusLine, sizeof(statusLine), "FAIL: no USB flash");
+    fullRedrawPending = true; Serial.println(statusLine); return;
   }
-
-  Serial.println("Writing profile.csv ...");
   File32 f;
   if (!f.open(&fatfs, "profile.csv", O_WRITE | O_CREAT | O_TRUNC)) {
-    snprintf(statusLine, sizeof(statusLine), "FAIL: could not open profile.csv for write");
-    fullRedrawPending = true;
-    Serial.println(statusLine);
-    return;
+    snprintf(statusLine, sizeof(statusLine), "FAIL: cannot open profile.csv for write");
+    fullRedrawPending = true; Serial.println(statusLine); return;
   }
-
   f.println("temp,dwell_seconds");
   for (int i = 0; i < N_TEST_STEPS; i++) {
-    f.print(TEST_TEMPS[i]);
-    f.print(",");
-    f.println(TEST_DWELLS[i]);
+    f.print(TEST_TEMPS[i]); f.print(","); f.println(TEST_DWELLS[i]);
   }
   f.close();
-
-  snprintf(statusLine, sizeof(statusLine),
-           "OK: wrote %d steps to profile.csv", N_TEST_STEPS);
-  fullRedrawPending = true;
-  Serial.println(statusLine);
+  snprintf(statusLine, sizeof(statusLine), "OK: wrote %d steps to profile.csv", N_TEST_STEPS);
+  fullRedrawPending = true; Serial.println(statusLine);
 }
 
 void doReadCSV() {
   if (!usbFsReady) {
-    snprintf(statusLine, sizeof(statusLine), "FAIL: no USB flash ready");
-    fullRedrawPending = true;
-    Serial.println(statusLine);
-    return;
+    snprintf(statusLine, sizeof(statusLine), "FAIL: no USB flash");
+    fullRedrawPending = true; Serial.println(statusLine); return;
   }
-
-  Serial.println("Reading profile.csv ...");
   File32 f;
   if (!f.open(&fatfs, "profile.csv", O_RDONLY)) {
     snprintf(statusLine, sizeof(statusLine), "FAIL: profile.csv not found");
-    fullRedrawPending = true;
-    Serial.println(statusLine);
-    return;
+    fullRedrawPending = true; Serial.println(statusLine); return;
   }
-
-  // Skip header line
-  while (f.available() && f.read() != '\n');
-
+  while (f.available() && f.read() != '\n');  // skip header line
   loadedCount = 0;
   char buf[64];
   while (f.available() && loadedCount < MAX_STEPS) {
@@ -269,51 +352,78 @@ void doReadCSV() {
     }
     buf[idx] = '\0';
     if (idx == 0) continue;
-
     float temp = atof(buf);
     if (temp <= 0.0f || isnan(temp)) continue;
-
     loadedSteps[loadedCount].temp = temp;
     char* comma = strchr(buf, ',');
-    loadedSteps[loadedCount].dwellMs =
-        comma ? (uint32_t)strtoul(comma + 1, NULL, 10) * 1000UL : 0;
-
-    Serial.printf("  step %d: %.0f C, dwell %lu ms\n",
-                  loadedCount + 1,
-                  loadedSteps[loadedCount].temp,
-                  loadedSteps[loadedCount].dwellMs);
+    loadedSteps[loadedCount].dwellMs = comma ? strtoul(comma + 1, NULL, 10) * 1000UL : 0;
+    Serial.printf("  step %d: %.0fC  dwell %lums\n",
+                  loadedCount + 1, loadedSteps[loadedCount].temp, loadedSteps[loadedCount].dwellMs);
     loadedCount++;
   }
   f.close();
-
-  snprintf(statusLine, sizeof(statusLine),
-           "OK: loaded %d steps from profile.csv", loadedCount);
-  fullRedrawPending = true;
-  Serial.println(statusLine);
+  snprintf(statusLine, sizeof(statusLine), "OK: loaded %d steps from profile.csv", loadedCount);
+  fullRedrawPending = true; Serial.println(statusLine);
 }
 
 void doClear() {
   loadedCount = 0;
-  snprintf(statusLine, sizeof(statusLine), "Cleared. Insert USB flash and read.");
-  fullRedrawPending = true;
-  Serial.println("Profile cleared");
+  snprintf(statusLine, sizeof(statusLine), "Cleared");
+  fullRedrawPending = true; Serial.println("[MEM] cleared");
 }
 
-// ── Core 0 ───────────────────────────────────────────────────────────────────
+void doSaveEEPROM(int slot) {
+  if (loadedCount == 0) {
+    snprintf(statusLine, sizeof(statusLine), "FAIL: nothing in memory to save");
+    fullRedrawPending = true; return;
+  }
+  EESlot& es = eedata.slots[slot];
+  es.numSteps = (uint8_t)(loadedCount <= EE_STEPS ? loadedCount : EE_STEPS);
+  for (int i = 0; i < es.numSteps; i++) {
+    es.steps[i].temp    = loadedSteps[i].temp;
+    es.steps[i].dwellMs = loadedSteps[i].dwellMs;
+  }
+  EEPROM.put(0, eedata);
+  commitEEPROMSafe();  // safe to call from loop() — Core 1 is running
+  snprintf(statusLine, sizeof(statusLine),
+           "OK: saved %d steps to EEPROM slot %d", es.numSteps, slot + 1);
+  fullRedrawPending = true; Serial.println(statusLine);
+}
+
+void doLoadEEPROM(int slot) {
+  EESlot& es = eedata.slots[slot];
+  if (es.numSteps == 0 || es.numSteps > EE_STEPS) {
+    snprintf(statusLine, sizeof(statusLine), "FAIL: slot %d is %s",
+             slot + 1, es.numSteps == 0 ? "empty" : "corrupt");
+    fullRedrawPending = true; Serial.println(statusLine); return;
+  }
+  loadedCount = es.numSteps;
+  for (int i = 0; i < loadedCount; i++) {
+    loadedSteps[i].temp    = es.steps[i].temp;
+    loadedSteps[i].dwellMs = es.steps[i].dwellMs;
+    Serial.printf("  step %d: %.0fC  dwell %lums\n",
+                  i + 1, loadedSteps[i].temp, loadedSteps[i].dwellMs);
+  }
+  snprintf(statusLine, sizeof(statusLine),
+           "OK: loaded %d steps from EEPROM slot %d", loadedCount, slot + 1);
+  fullRedrawPending = true; Serial.println(statusLine);
+}
+
+// ── Core 0 setup / loop ──────────────────────────────────────────────────────
 void setup() {
-  set_sys_clock_khz(120000, true);  // PIO USB requires 120 or 240 MHz
+  set_sys_clock_khz(120000, true);
   Serial.begin(115200);
 
   tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-  tft.print("PROFILE_USB_TEST");
-  tft.setCursor(10, 35);
+  tft.print("PROFILE+EEPROM TEST");
   tft.setTextSize(1);
   tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.setCursor(10, 36);
   tft.print("Starting...");
 
   pinMode(ENC_SW, INPUT_PULLUP);
@@ -323,26 +433,32 @@ void setup() {
   enc_sm     = pio_claim_unused_sm(enc_pio, true);
   quadrature_program_init(enc_pio, enc_sm, enc_offset, ENC_A, ENC_B);
 
-  Serial.println("PROFILE_USB_TEST ready — insert flash drive");
+  initEEPROM();  // loads from flash; sets pendingEEPROMCommit if uninitialised
+
+  Serial.println("Ready");
 }
 
 void loop() {
-  // ── USB events ──────────────────────────────────────────────────────────
+  // Deferred EEPROM commit (first boot only — Core 1 was not running in setup())
+  if (pendingEEPROMCommit) {
+    pendingEEPROMCommit = false;
+    commitEEPROMSafe();
+  }
+
+  // USB events
   if (usbJustMounted) {
     usbJustMounted = false;
-    Serial.println("[USB] device mounted, opening FAT ...");
+    Serial.println("[USB] opening FAT...");
     if (fatfs.begin(&msc_block_dev)) {
       usbFsReady = true;
       snprintf(statusLine, sizeof(statusLine), "USB flash mounted (FAT32 OK)");
-      Serial.println("[USB] FAT32 mounted OK");
+      Serial.println("[USB] FAT32 OK");
     } else {
-      snprintf(statusLine, sizeof(statusLine),
-               "FAIL: FAT mount failed (not FAT32?)");
+      snprintf(statusLine, sizeof(statusLine), "FAIL: FAT mount failed (not FAT32?)");
       Serial.println("[USB] FAT mount FAILED");
     }
     fullRedrawPending = true;
   }
-
   if (usbJustUnmounted) {
     usbJustUnmounted = false;
     usbFsReady = false;
@@ -351,29 +467,32 @@ void loop() {
     fullRedrawPending = true;
   }
 
-  // ── Encoder rotation ────────────────────────────────────────────────────
+  // Encoder rotation
   pio_sm_exec_wait_blocking(enc_pio, enc_sm, pio_encode_in(pio_x, 32));
   int32_t raw   = (int32_t)pio_sm_get_blocking(enc_pio, enc_sm);
   int32_t delta = raw - enc_raw_last;
   enc_raw_last  = raw;
-
   if (delta != 0) {
     menuSel = ((menuSel + delta) % NUM_ITEMS + NUM_ITEMS) % NUM_ITEMS;
-    Serial.printf("[ENC] delta=%d  menuSel=%d (%s)\n", delta, menuSel, MENU[menuSel]);
+    Serial.printf("[ENC] delta=%d  sel=%d (%s)\n", delta, menuSel, MENU[menuSel]);
   }
 
-  // ── Button press ─────────────────────────────────────────────────────────
+  // Button press
   if (btnPressed) {
     btnPressed = false;
-    Serial.printf("[BTN] pressed: action %d (%s)\n", menuSel, MENU[menuSel]);
+    Serial.printf("[BTN] sel=%d: %s\n", menuSel, MENU[menuSel]);
     switch (menuSel) {
-      case 0: doWriteCSV(); break;
-      case 1: doReadCSV();  break;
-      case 2: doClear();    break;
+      case 0: doWriteCSV();    break;
+      case 1: doReadCSV();     break;
+      case 2: doClear();       break;
+      case 3: doSaveEEPROM(0); break;
+      case 4: doLoadEEPROM(0); break;
+      case 5: doSaveEEPROM(1); break;
+      case 6: doLoadEEPROM(1); break;
     }
   }
 
-  // ── Display update ───────────────────────────────────────────────────────
+  // Display
   if (fullRedrawPending) {
     drawAll();
   } else if (menuSel != lastMenuSel) {
@@ -396,5 +515,12 @@ void setup1() {
 }
 
 void loop1() {
+  core1Ready = true;   // signal: setup1() is done, safe to pause this core
+  if (core1PauseRequest) {
+    core1PauseAck = true;
+    while (core1PauseRequest) { tight_loop_contents(); }
+    core1PauseAck = false;
+    return;            // skip USBHost.task() for this iteration
+  }
   USBHost.task();
 }
