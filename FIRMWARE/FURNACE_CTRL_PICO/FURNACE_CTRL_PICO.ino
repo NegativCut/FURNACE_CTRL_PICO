@@ -175,6 +175,16 @@ EEData eedata;                        // RAM mirror; loaded on boot
 // of the next iteration when no USB file I/O is in progress.
 bool   pendingEEPROMCommit = false;
 
+// Core 1 pause protocol — lets Core 0 safely call EEPROM.commit().
+// EEPROM.commit() uses multicore_lockout_start_blocking() which sends a doorbell
+// interrupt to Core 1.  If Core 1 is inside a TinyUSB critical section with
+// interrupts disabled that doorbell is never acknowledged and Core 0 hangs forever.
+// Fix: Core 0 asks Core 1 to park in a spin loop (interrupts enabled) before
+// touching flash; the lockout then completes in microseconds.
+volatile bool core1Ready        = false;  // set once at start of loop1(), never cleared
+volatile bool core1PauseRequest = false;
+volatile bool core1PauseAck     = false;
+
 // Profile selector sub-menu
 bool inProfileSelect       = false;
 int  profileSelectItem     = 0;       // 0–4 = slot, 5 = Back
@@ -314,6 +324,7 @@ void loadSettingsFromEEPROM();
 void saveSettingsToEEPROM();
 void loadProfileFromEEPROM(int slot);
 void saveProfileToEEPROM(int slot);
+void commitEEPROMSafe();
 void drawProfileGraph();
 
 void escOn() {
@@ -419,12 +430,11 @@ void setup() {
 }
 
 void loop() {
-  // Deferred EEPROM commit — runs when no USB file I/O is in progress and
-  // Core 1 is idle in USBHost.task(). Never commit during setup() or mid-transaction.
+  // Deferred EEPROM commit — Core 1 is paused before the flash write so the
+  // multicore lockout inside EEPROM.commit() can be acquired without deadlocking.
   if (pendingEEPROMCommit) {
     pendingEEPROMCommit = false;
-    EEPROM.commit();
-    Serial.println("EEPROM committed");
+    commitEEPROMSafe();
   }
 
   digitalWrite(ledpin, LOW);
@@ -1057,6 +1067,28 @@ void saveSettingsToEEPROM() {
   EEPROM.put(0, eedata);
   pendingEEPROMCommit = true;
   Serial.println("Settings staged for EEPROM commit");
+}
+
+// Safely commit EEPROM from Core 0 without deadlocking the PIO USB host on Core 1.
+// Must only be called from loop() (Core 0), never from setup() or callbacks.
+void commitEEPROMSafe() {
+  // Wait until loop1() is running — guarantees setup1() (USB init) is complete.
+  // Only blocks on the very first commit after a cold boot with uninitialised EEPROM.
+  while (!core1Ready) { tight_loop_contents(); }
+
+  // Ask Core 1 to exit USBHost.task() and park in a spin loop with interrupts enabled.
+  // Once core1PauseAck is true, Core 1 is NOT inside any TinyUSB critical section,
+  // so the multicore lockout used by EEPROM.commit() can be acquired immediately.
+  core1PauseRequest = true;
+  while (!core1PauseAck) { tight_loop_contents(); }
+
+  EEPROM.commit();
+
+  // Release Core 1 and wait for it to resume normal USB polling.
+  core1PauseRequest = false;
+  while (core1PauseAck) { tight_loop_contents(); }
+
+  Serial.println("EEPROM committed");
 }
 
 void initEEPROM() {
@@ -2017,6 +2049,13 @@ void setup1() {
 }
 
 void loop1() {
+  core1Ready = true;  // signal: setup1() is complete, safe to pause this core
+  if (core1PauseRequest) {
+    core1PauseAck = true;
+    while (core1PauseRequest) { tight_loop_contents(); }
+    core1PauseAck = false;
+    return;  // skip USBHost.task() for this iteration; Core 0 owns the bus
+  }
   USBHost.task();
 }
 
