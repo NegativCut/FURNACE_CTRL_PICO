@@ -1,6 +1,6 @@
 # furnace_ctrl_pico — Claude Session Notes
 
-Last updated: 2026-02-24
+Last updated: 2026-02-25
 
 ---
 
@@ -43,7 +43,10 @@ SD card socket (D12–D15, D19) removed. SPI1 dropped from firmware.
 - TFT config: `FIRMWARE/FURNACE_CTRL_PICO/User_Setup_pi_furnace.h`
 - Temperature pipeline: raw → +tcOffset → medianFilter (circular, 1–128) → EMA → `currentTempC`
 - 4 main menu options: Logging, Profile run, Learn mode, Settings
-- All storage on USB flash drive: `settings.csv`, `profile.csv`, `learned.csv`, `log_N.csv`
+- Settings + 5 profile slots stored in on-chip EEPROM (EEPROM.begin(512), 477 bytes used)
+- USB flash used for: logging (`log_N.csv`), importing settings/profiles, saving learned data
+- On boot: EEPROM always wins for settings; USB mount prompts for settings/profile import
+- Main menu shows staircase profile graph (x=162..476, y=152..310); past=grey, current=green/cyan, future=light grey; dotted orange = current temp
 - SD.h and SPI1 removed (Phase 3 complete)
 - PC (micro-USB, device mode) and flash drive (USB-A on D27/D28, host mode) are **never concurrent**
 - GPIO24 detects PC presence on micro-USB (internal VBUS divider, no wiring needed)
@@ -113,7 +116,7 @@ Only `earlyCutoff` is read back by profile mode. The rest are stored for future 
 ## Remaining Opportunities
 - [ ] Use `rateOfRise` at cutoff to improve earlyCutoff prediction (stored but unused)
 - [ ] Proportional blower speed during coast (currently full-on or off)
-- [ ] USB host migration (see section below)
+- [ ] Named profile slots (currently named "1"–"5"; name editing UI not yet implemented)
 
 ---
 
