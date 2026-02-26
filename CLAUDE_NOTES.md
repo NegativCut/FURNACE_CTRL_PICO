@@ -1,6 +1,6 @@
 # furnace_ctrl_pico — Claude Session Notes
 
-Last updated: 2026-02-25
+Last updated: 2026-02-26
 
 ---
 
@@ -43,11 +43,13 @@ SD card socket (D12–D15, D19) removed. SPI1 dropped from firmware.
 - TFT config: `FIRMWARE/FURNACE_CTRL_PICO/User_Setup_pi_furnace.h`
 - Temperature pipeline: raw → +tcOffset → medianFilter (circular, 1–128) → EMA → `currentTempC`
 - 4 main menu options: Logging, Profile run, Learn mode, Settings
-- Settings + 5 profile slots stored in on-chip EEPROM (EEPROM.begin(512), 477 bytes used)
-- USB flash used for: logging (`log_N.csv`), importing settings/profiles, saving learned data
-- On boot: EEPROM always wins for settings; USB mount prompts for settings/profile import
+- Settings loaded from `settings.csv` on USB mount; saved back to `settings.csv` on Settings→Back (deferred to next loop() iteration via `pendingSaveSettings` flag)
+- Profile loaded from `profile.csv` on USB mount or when toggled ON
+- Learned data saved/loaded from `learned.csv`
+- Log files named `log_N.csv` where N = mount count since power-on (no existence-check loop)
 - Main menu shows staircase profile graph (x=162..476, y=152..310); past=grey, current=green/cyan, future=light grey; dotted orange = current temp
 - SD.h and SPI1 removed (Phase 3 complete)
+- **No EEPROM** — EEPROM.commit() deadlocks with USB host on Core 1; abandoned
 - PC (micro-USB, device mode) and flash drive (USB-A on D27/D28, host mode) are **never concurrent**
 - GPIO24 detects PC presence on micro-USB (internal VBUS divider, no wiring needed)
 
@@ -112,11 +114,13 @@ Only `earlyCutoff` is read back by profile mode. The rest are stored for future 
 | earlyCutoff fully overwritten each run — oscillated | 30/70 exponential blend with previous value (`LEARN_CUTOFF_BLEND`) |
 | No temp maintenance during dwell | Restructured ramp block; heating dwell uses relay hysteresis |
 | loadSettings() left median buffer uninitialised if window increased | Resets `tcBufferIdx`/`tcBufferCount` after loading new window size |
+| Random freezes on any USB file I/O | Core 1 pause protocol — see below |
+| Freeze during log file naming on USB mount | Eliminated `fatfs.exists()` loop; use static mount counter instead |
+| Settings not saved on exit | Deferred `saveSettings()` via `pendingSaveSettings` flag; called at top of next `loop()` iteration |
 
 ## Remaining Opportunities
 - [ ] Use `rateOfRise` at cutoff to improve earlyCutoff prediction (stored but unused)
 - [ ] Proportional blower speed during coast (currently full-on or off)
-- [ ] Named profile slots (currently named "1"–"5"; name editing UI not yet implemented)
 
 ---
 
@@ -271,3 +275,59 @@ if (usbFlashJustMounted) {
 Rule: **read the working test sketch first; treat it as ground truth; match it.**
 Do not theorise about Core 0/Core 1 deadlocks or move `begin()` around without
 an observable failure (not a theory) as justification.
+
+---
+
+## Lesson: Core 1 pause protocol for USB file I/O
+
+**Root cause of random freezes:** SdFat file operations (open/read/write/close) internally
+call `tuh_task()` in a spin loop waiting for USB MSC transfers to complete. Core 1 also calls
+`tuh_task()` via `USBHost.task()`. Two cores calling `tuh_task()` simultaneously is a race
+condition on TinyUSB's internal event queue. It is intermittent and timing-dependent —
+it may not appear during initial testing but will eventually manifest.
+
+**Additional trigger:** `fatfs.exists()` called in a loop (e.g. finding the next log filename)
+does N rapid USB reads and multiplies the race probability N-fold.
+
+**Fix — Core 1 cooperative pause:**
+
+```cpp
+volatile bool core1PauseRequest = false;
+volatile bool core1PauseAck     = false;
+
+void pauseCore1() {
+  core1PauseRequest = true;
+  while (!core1PauseAck) { tight_loop_contents(); }
+}
+void resumeCore1() {
+  core1PauseRequest = false;
+  while (core1PauseAck) { tight_loop_contents(); }
+}
+
+void loop1() {
+  if (core1PauseRequest) {
+    core1PauseAck = true;
+    while (core1PauseRequest) { tight_loop_contents(); }
+    core1PauseAck = false;
+    return;   // skip USBHost.task() this iteration
+  }
+  USBHost.task();
+}
+```
+
+While Core 1 is parked, USB IRQs still fire on Core 1 (interrupts enabled) and queue events.
+Core 0's `tuh_task()` (called from within SdFat) processes those events alone. No race.
+
+**Rule: wrap EVERY USB file I/O function with `pauseCore1()` / `resumeCore1()`.** This includes
+`loadSettings()`, `saveSettings()`, `readProfile()`, `loadLearnedData()`, `saveLearnedData()`,
+`logData()`, and any inline file creation blocks. Add `resumeCore1()` before every early return.
+Do NOT nest pause calls — each function manages its own pause.
+
+**EEPROM.commit() has a different but related problem:** it calls `multicore_lockout_start_blocking()`
+which sends an NMI to Core 1. If Core 1 is in a USB critical section with interrupts disabled,
+the NMI is never acknowledged and Core 0 hangs forever. The Core 1 pause protocol fixes this too,
+but in practice EEPROM + USB host is too fragile — avoid using EEPROM with USB host on RP2040.
+
+**Power cycle required after UF2 upload.** PIO USB host does not reinitialise cleanly from a
+software reset. Always power cycle after flashing before testing. This is a known pico-pio-usb
+limitation, not a firmware bug.

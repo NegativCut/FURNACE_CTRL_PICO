@@ -1,3 +1,4 @@
+
 // =============================================================================
 // ELECTRICAL CONNECTIONS  (Arduino D-number / Pico physical pin)
 // =============================================================================
@@ -83,7 +84,6 @@ TFT_eSPI tft = TFT_eSPI();
 #include "pio_usb.h"            // must be before Adafruit_TinyUSB.h
 #include "Adafruit_TinyUSB.h"
 #include "quadrature.pio.h"
-#include <EEPROM.h>
 #define QUADRATURE_A_PIN 9
 #define QUADRATURE_B_PIN 10
 PIO pio = pio0;
@@ -101,40 +101,11 @@ volatile bool swPressed = false;
 #define menuTextSize 2
 #define NUM_OPTIONS 4
 #define NUM_SETTINGS 7
-#define MAX_MEDIAN_WINDOW 128
+#define MAX_MEDIAN_WINDOW 256
 #define DRAW_INTERVAL     250
 #define LOG_INTERVAL_MS   10000
 #define LEARN_CUTOFF_BLEND    0.3f   // weight of new measurement in earlyCutoff average
 #define DWELL_HYSTERESIS_C    2.0f   // relay re-fires when temp drops this far below target
-
-// ── EEPROM Layout  (477 bytes — fits in EEPROM.begin(512)) ───────────────────
-#define EEPROM_MAGIC      0xAF42   // bump if struct layout changes
-#define EEPROM_PROFILES   5
-#define EEPROM_MAX_STEPS  10
-
-struct __attribute__((packed)) EESettings {
-  float    tcSmoothing;       // 4 bytes
-  float    tcOffset;          // 4 bytes
-  uint16_t tcMedianWindow;    // 2 bytes
-};  // 10 bytes
-
-struct __attribute__((packed)) EEStep {
-  float    targetTemp;        // 4 bytes
-  uint32_t dwellMs;           // 4 bytes
-};  // 8 bytes
-
-struct __attribute__((packed)) EEProfile {
-  char    name[12];                    // 12 bytes  null-terminated
-  uint8_t numSteps;                    // 1 byte    0 = empty slot
-  EEStep  steps[EEPROM_MAX_STEPS];    // 80 bytes
-};  // 93 bytes
-
-struct __attribute__((packed)) EEData {
-  uint16_t   magic;                          // 2 bytes
-  EESettings settings;                       // 10 bytes
-  EEProfile  profiles[EEPROM_PROFILES];      // 5 × 93 = 465 bytes
-};  // 477 bytes
-// ─────────────────────────────────────────────────────────────────────────────
 
 #include "Adafruit_MAX31855.h"
 #define MAXDO   5
@@ -165,37 +136,9 @@ volatile bool usbFlashJustMounted   = false;
 volatile bool usbFlashJustUnmounted = false;
 bool          pcConnected           = false;
 bool          usbFsReady            = false;   // FAT volume successfully mounted
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ── EEPROM ───────────────────────────────────────────────────────────────────
-EEData eedata;                        // RAM mirror; loaded on boot
-// EEPROM.commit() must NEVER be called directly — it uses multicore_lockout
-// which deadlocks if Core 1 is inside a USB interrupt critical section.
-// Always set pendingEEPROMCommit = true instead; loop() commits at the top
-// of the next iteration when no USB file I/O is in progress.
-bool   pendingEEPROMCommit = false;
-
-// Core 1 pause protocol — lets Core 0 safely call EEPROM.commit().
-// EEPROM.commit() uses multicore_lockout_start_blocking() which sends a doorbell
-// interrupt to Core 1.  If Core 1 is inside a TinyUSB critical section with
-// interrupts disabled that doorbell is never acknowledged and Core 0 hangs forever.
-// Fix: Core 0 asks Core 1 to park in a spin loop (interrupts enabled) before
-// touching flash; the lockout then completes in microseconds.
-volatile bool core1Ready        = false;  // set once at start of loop1(), never cleared
+// Core 1 pause protocol — prevents tuh_task() race during USB file I/O
 volatile bool core1PauseRequest = false;
 volatile bool core1PauseAck     = false;
-
-// Profile selector sub-menu
-bool inProfileSelect       = false;
-int  profileSelectItem     = 0;       // 0–4 = slot, 5 = Back
-bool profileSelectForLearn = false;
-
-// USB import prompts
-bool inUsbPrompt              = false;
-int  usbPromptType            = 0;    // 0=settings yes/no, 1=profile slot
-int  usbPromptItem            = 0;    // 0=Yes/1=No  OR  0–4=slot
-bool pendingUsbProfilePrompt  = false;
-// ─────────────────────────────────────────────────────────────────────────────
 
 unsigned long lastLogTime = 0;
 const unsigned long logInterval = LOG_INTERVAL_MS;
@@ -213,6 +156,7 @@ bool smoothedSeeded = false;
 bool inSettings = false;
 int settingsItem = 0;
 bool settingsEditing = false;
+bool pendingSaveSettings = false;
 bool testEscOn = false;
 int testEscPct = 50;   // 0-100% in 5% steps
 bool testRelay = false;
@@ -297,10 +241,6 @@ int lastCurrentStep = -1;
 bool lastDwelling = false;
 int lastInternalTemp = 0;
 char lastTcStr[10];
-bool lastInProfileSelect = false;
-int  lastProfileSelectItem = -1;
-bool lastInUsbPrompt = false;
-int  lastUsbPromptItem = -1;
 
 // Forward declarations
 void readProfile();
@@ -308,24 +248,18 @@ void loadLearnedData();
 void saveLearnedData();
 void loadSettings();
 void saveSettings();
+void pauseCore1();
+void resumeCore1();
 float tickLearnMode();
 void drawMenu(float setpointTemp);
+void drawProfileGraph();
 void drawSettings();
-void drawProfileSelect();
-void drawUsbPrompt();
 void stopAllOutputs();
 void freeProfile();
 void freeLearned();
 void resetLearnState();
 void escOn();
 void escOff();
-void initEEPROM();
-void loadSettingsFromEEPROM();
-void saveSettingsToEEPROM();
-void loadProfileFromEEPROM(int slot);
-void saveProfileToEEPROM(int slot);
-void commitEEPROMSafe();
-void drawProfileGraph();
 
 void escOn() {
   if (!escServo.attached()) escServo.attach(esc);
@@ -391,8 +325,6 @@ void setup() {
 
   delay(500);
 
-  initEEPROM();   // loads settings from EEPROM (or writes defaults); sets tcOffset/tcMedianWindow
-
   // Seed smoothed temp and median buffer with first valid reading
   float initTemp = thermocouple.readCelsius();
   if (!isnan(initTemp)) {
@@ -430,11 +362,11 @@ void setup() {
 }
 
 void loop() {
-  // Deferred EEPROM commit — Core 1 is paused before the flash write so the
-  // multicore lockout inside EEPROM.commit() can be acquired without deadlocking.
-  if (pendingEEPROMCommit) {
-    pendingEEPROMCommit = false;
-    commitEEPROMSafe();
+  // Deferred settings save — runs at the top of a fresh iteration, no TFT
+  // or button-handler activity in progress, USB host on Core 1 running normally.
+  if (pendingSaveSettings && usbFsReady) {
+    pendingSaveSettings = false;
+    saveSettings();
   }
 
   digitalWrite(ledpin, LOW);
@@ -468,7 +400,7 @@ void loop() {
   last_encoder_value = raw;
   encoder_value = raw;
 
-  // Encoder routing: settings sub-menu vs profile select vs usb prompt vs main menu
+  // Encoder routing: settings sub-menu vs main menu
   if (delta != 0) {
     if (inSettings) {
       if (settingsEditing) {
@@ -501,11 +433,6 @@ void loop() {
         // Navigate settings items
         settingsItem = ((settingsItem + delta) % NUM_SETTINGS + NUM_SETTINGS) % NUM_SETTINGS;
       }
-    } else if (inProfileSelect) {
-      profileSelectItem = ((profileSelectItem + delta) % 6 + 6) % 6;
-    } else if (inUsbPrompt) {
-      int items = (usbPromptType == 0) ? 2 : EEPROM_PROFILES;
-      usbPromptItem = ((usbPromptItem + delta) % items + items) % items;
     } else {
       selectedOption = ((selectedOption + delta) % NUM_OPTIONS + NUM_OPTIONS) % NUM_OPTIONS;
     }
@@ -523,36 +450,29 @@ void loop() {
     if (fatfs.begin(&msc_block_dev)) {
       usbFsReady = true;
       Serial.println("[USB] FAT32 mounted");
-
-      // Check for importable files and prompt user
-      if (fatfs.exists("settings.csv")) {
-        inUsbPrompt = true; usbPromptType = 0; usbPromptItem = 0;
-        lastInUsbPrompt = false; lastUsbPromptItem = -1;
-        tft.fillScreen(TFT_BLACK);
-      }
-      if (fatfs.exists("profile.csv")) {
-        if (inUsbPrompt) {
-          pendingUsbProfilePrompt = true;   // show after settings prompt dismissed
-        } else {
-          inUsbPrompt = true; usbPromptType = 1; usbPromptItem = 0;
-          lastInUsbPrompt = false; lastUsbPromptItem = -1;
-          tft.fillScreen(TFT_BLACK);
-        }
-      }
-
-      // Create log file
-      int fileCounter = 0;
-      snprintf(logFileName, sizeof(logFileName), "log_%d.csv", fileCounter);
-      while (fatfs.exists(logFileName)) {
-        fileCounter++;
-        snprintf(logFileName, sizeof(logFileName), "log_%d.csv", fileCounter);
-      }
+      loadSettings();
+      // Use a static mount counter for log naming — avoids the exists() loop
+      // which does N rapid USB reads and can trigger the tuh_task() race condition.
+      // Logs reset to log_0 on power cycle; pull data before cycling power.
+      static int logMountCount = 0;
+      snprintf(logFileName, sizeof(logFileName), "log_%d.csv", logMountCount++);
+      pauseCore1();
       File32 f;
       if (f.open(&fatfs, logFileName, O_WRITE | O_CREAT | O_TRUNC)) {
         Serial.print("[USB] Log: "); Serial.println(logFileName);
         f.println("Timestamp,PotValue,EncoderValue,InternalTemp,ThermocoupleTemp,"
                   "SetpointTemp,SSR_Esc,SSR_Relay,Step,LearnPhase,Dwelling");
         f.close();
+      }
+      resumeCore1();
+      if (readProfileEnabled) {
+        readProfile();
+        loadLearnedData();
+        if (numSteps > 0 && !rampActive) {
+          currentStep = 0;
+          startTemp = isnan(currentTempC) ? 25.0f : currentTempC;
+          rampActive = true; rampHeating = true;
+        }
       }
     } else {
       Serial.println("[USB] FAT32 mount failed — needs FAT32 formatted drive");
@@ -562,11 +482,9 @@ void loop() {
   if (usbFlashJustUnmounted) {
     usbFlashJustUnmounted = false;
     usbFsReady = false;
-    inUsbPrompt = false; pendingUsbProfilePrompt = false;
-    inProfileSelect = false;
     Serial.println("[USB] Flash drive removed");
-    loggingEnabled = false;
-    stopAllOutputs();
+    loggingEnabled = false;   // can't log without flash
+    // Profile/learn continue — data is already in RAM
   }
   // ───────────────────────────────────────────────────────────
 
@@ -579,32 +497,29 @@ void loop() {
     if (inSettings) {
       // Settings sub-menu button handling
       if (settingsItem == 6) {
-        // "Back" — exit settings, save to EEPROM, stop test outputs
+        // "Back" — exit settings, save, stop test outputs
         inSettings = false;
         settingsEditing = false;
         testEscOn = false;
         escOff();
         testRelay = false;
         stopAllOutputs();
-        saveSettingsToEEPROM();
+        if (usbFsReady) pendingSaveSettings = true;
         tft.fillScreen(TFT_BLACK);
         // Force full main menu redraw
-        lastSelectedOption  = -1;
-        lastUsbMounted      = !usbFlashMounted;
-        lastPcConnected     = !pcConnected;
-        lastLogging         = !loggingEnabled;
-        lastProfile         = !readProfileEnabled;
-        lastLearnMode       = !learnModeEnabled;
-        lastRampActive      = !rampActive;
-        lastLearnActive     = !learnModeActive;
-        lastCurrentStep     = -1;
+        lastSelectedOption = -1;
+        lastUsbMounted     = !usbFlashMounted;
+        lastPcConnected    = !pcConnected;
+        lastLogging        = !loggingEnabled;
+        lastProfile        = !readProfileEnabled;
+        lastLearnMode      = !learnModeEnabled;
+        lastRampActive     = !rampActive;
+        lastLearnActive    = !learnModeActive;
+        lastCurrentStep    = -1;
         strcpy(lastTcStr, "~");
-        lastAverage         = average - 1;
-        lastInternalTemp    = currentInternalTemp - 1;
-        lastEncoderVal      = encoder_value - 1;
-        lastInSettings      = false;
-        lastInProfileSelect = false;
-        lastInUsbPrompt     = false;
+        lastAverage        = average - 1;
+        lastInternalTemp   = currentInternalTemp - 1;
+        lastEncoderVal     = encoder_value - 1;
       } else if (settingsItem == 3) {
         // Toggle ESC on/off
         testEscOn = !testEscOn;
@@ -628,147 +543,6 @@ void loop() {
         settingsEditing = !settingsEditing;
       }
 
-    } else if (inProfileSelect) {
-      if (profileSelectItem == 5) {
-        // Back — return to main menu
-        inProfileSelect = false;
-        tft.fillScreen(TFT_BLACK);
-        lastSelectedOption  = -1;
-        lastUsbMounted      = !usbFlashMounted;
-        lastPcConnected     = !pcConnected;
-        lastLogging         = !loggingEnabled;
-        lastProfile         = !readProfileEnabled;
-        lastLearnMode       = !learnModeEnabled;
-        lastRampActive      = !rampActive;
-        lastLearnActive     = !learnModeActive;
-        lastCurrentStep     = -1;
-        strcpy(lastTcStr, "~");
-        lastAverage         = average - 1;
-        lastInternalTemp    = currentInternalTemp - 1;
-        lastEncoderVal      = encoder_value - 1;
-        lastInSettings      = false;
-        lastInProfileSelect = false;
-        lastInUsbPrompt     = false;
-      } else {
-        int slot = profileSelectItem;
-        loadProfileFromEEPROM(slot);
-        if (profileSelectForLearn) {
-          // Start learn mode using this slot's profile
-          learnModeEnabled = true;
-          readProfileEnabled = false; rampActive = false;
-          if (numSteps > 0) {
-            loadLearnedData();          // USB only — silently fails if not present
-            LearnedStep* nl = (LearnedStep*)malloc(numSteps * sizeof(LearnedStep));
-            if (nl) {
-              memset(nl, 0, numSteps * sizeof(LearnedStep));
-              int copyCount = (numLearned < numSteps) ? numLearned : numSteps;
-              for (int i = 0; i < copyCount; i++) nl[i] = learned[i];
-              free(learned); learned = nl; numLearned = copyCount;
-              currentStep = 0;
-              startTemp = isnan(currentTempC) ? 25.0f : currentTempC;
-              learnStepStartTime = learnPhaseStartTime = millis();
-              learnPeakTemp = 0; learnTargetCrossTime = 0; learnRateAtCutoff = 0;
-              learnPrevTemp = startTemp; learnPrevTime = millis();
-              learnModeActive = true;
-              float tgt = steps[0].targetTemp;
-              learnPhase = (tgt < learnPrevTemp) ? LEARN_COOLING : LEARN_HEATING;
-              Serial.printf("Learn mode started: %d steps\n", numSteps);
-            } else {
-              Serial.println("Failed to allocate learned array");
-              learnModeEnabled = false;
-            }
-          } else {
-            learnModeEnabled = false;
-          }
-        } else {
-          // Start profile run using this slot's profile
-          readProfileEnabled = true;
-          learnModeEnabled = false; learnModeActive = false; learnPhase = LEARN_IDLE;
-          loadLearnedData();          // USB only — silently fails if not present
-          if (numSteps > 0) {
-            currentStep = 0;
-            startTemp = isnan(currentTempC) ? 25.0f : currentTempC;
-            rampActive = true; rampHeating = true;
-          } else {
-            readProfileEnabled = false;
-          }
-        }
-        inProfileSelect = false;
-        tft.fillScreen(TFT_BLACK);
-        lastSelectedOption  = -1;
-        lastUsbMounted      = !usbFlashMounted;
-        lastPcConnected     = !pcConnected;
-        lastLogging         = !loggingEnabled;
-        lastProfile         = !readProfileEnabled;
-        lastLearnMode       = !learnModeEnabled;
-        lastRampActive      = !rampActive;
-        lastLearnActive     = !learnModeActive;
-        lastCurrentStep     = -1;
-        strcpy(lastTcStr, "~");
-        lastAverage         = average - 1;
-        lastInternalTemp    = currentInternalTemp - 1;
-        lastEncoderVal      = encoder_value - 1;
-        lastInSettings      = false;
-        lastInProfileSelect = false;
-        lastInUsbPrompt     = false;
-      }
-
-    } else if (inUsbPrompt) {
-      if (usbPromptType == 0) {           // settings Yes/No
-        if (usbPromptItem == 0) {         // Yes — load from USB and save to EEPROM
-          loadSettings();
-          saveSettingsToEEPROM();
-        }
-        inUsbPrompt = false;
-        if (pendingUsbProfilePrompt) {
-          pendingUsbProfilePrompt = false;
-          inUsbPrompt = true; usbPromptType = 1; usbPromptItem = 0;
-          lastInUsbPrompt = false; lastUsbPromptItem = -1;
-          tft.fillScreen(TFT_BLACK);
-        } else {
-          tft.fillScreen(TFT_BLACK);
-          lastSelectedOption  = -1;
-          lastUsbMounted      = !usbFlashMounted;
-          lastPcConnected     = !pcConnected;
-          lastLogging         = !loggingEnabled;
-          lastProfile         = !readProfileEnabled;
-          lastLearnMode       = !learnModeEnabled;
-          lastRampActive      = !rampActive;
-          lastLearnActive     = !learnModeActive;
-          lastCurrentStep     = -1;
-          strcpy(lastTcStr, "~");
-          lastAverage         = average - 1;
-          lastInternalTemp    = currentInternalTemp - 1;
-          lastEncoderVal      = encoder_value - 1;
-          lastInSettings      = false;
-          lastInProfileSelect = false;
-          lastInUsbPrompt     = false;
-        }
-      } else {                            // profile slot select — import profile.csv
-        int slot = usbPromptItem;
-        readProfile();                    // reads profile.csv from USB into steps[]
-        saveProfileToEEPROM(slot);
-        freeProfile();                    // free temporary steps[] — slot data is now in EEPROM
-        inUsbPrompt = false;
-        tft.fillScreen(TFT_BLACK);
-        lastSelectedOption  = -1;
-        lastUsbMounted      = !usbFlashMounted;
-        lastPcConnected     = !pcConnected;
-        lastLogging         = !loggingEnabled;
-        lastProfile         = !readProfileEnabled;
-        lastLearnMode       = !learnModeEnabled;
-        lastRampActive      = !rampActive;
-        lastLearnActive     = !learnModeActive;
-        lastCurrentStep     = -1;
-        strcpy(lastTcStr, "~");
-        lastAverage         = average - 1;
-        lastInternalTemp    = currentInternalTemp - 1;
-        lastEncoderVal      = encoder_value - 1;
-        lastInSettings      = false;
-        lastInProfileSelect = false;
-        lastInUsbPrompt     = false;
-      }
-
     } else {
       // Main menu button handling
       if (selectedOption == 0) {
@@ -778,25 +552,82 @@ void loop() {
         Serial.println(loggingEnabled ? "ON" : "OFF");
 
       } else if (selectedOption == 1) {
-        // Profile — stop if active, else open slot selector
-        if (rampActive) {
-          readProfileEnabled = false; rampActive = false; dwelling = false;
-          freeProfile(); stopAllOutputs();
+        // Toggle profile run
+        readProfileEnabled = !readProfileEnabled;
+        Serial.print("Profile: ");
+        Serial.println(readProfileEnabled ? "ON" : "OFF");
+        if (readProfileEnabled) {
+          learnModeEnabled = false;
+          learnModeActive = false;
+          learnPhase = LEARN_IDLE;
+          if (usbFsReady) {
+            readProfile();
+            loadLearnedData();
+            if (numSteps > 0) {
+              currentStep = 0;
+              startTemp = isnan(currentTempC) ? 25.0f : currentTempC;
+              rampActive = true;
+              rampHeating = true;
+            }
+          }
         } else {
-          inProfileSelect = true; profileSelectItem = 0; profileSelectForLearn = false;
-          lastInProfileSelect = false; lastProfileSelectItem = -1;
-          tft.fillScreen(TFT_BLACK);
+          rampActive = false;
+          dwelling = false;
+          freeProfile();
+          stopAllOutputs();
         }
 
       } else if (selectedOption == 2) {
-        // Learn — stop if active, else open slot selector
-        if (learnModeActive) {
-          learnModeEnabled = false; learnModeActive = false; learnPhase = LEARN_IDLE;
-          stopAllOutputs();
+        // Toggle learn mode
+        learnModeEnabled = !learnModeEnabled;
+        Serial.print("Learn: ");
+        Serial.println(learnModeEnabled ? "ON" : "OFF");
+        if (learnModeEnabled) {
+          readProfileEnabled = false;
+          rampActive = false;
+          if (usbFsReady) {
+            readProfile();
+            if (numSteps > 0) {
+              loadLearnedData();
+              LearnedStep* newLearned = (LearnedStep*)malloc(numSteps * sizeof(LearnedStep));
+              if (newLearned) {
+                memset(newLearned, 0, numSteps * sizeof(LearnedStep));
+                int copyCount = (numLearned < numSteps) ? numLearned : numSteps;
+                for (int i = 0; i < copyCount; i++) {
+                  newLearned[i] = learned[i];
+                }
+                free(learned);
+                learned = newLearned;
+                numLearned = copyCount;
+
+                currentStep = 0;
+                startTemp = isnan(currentTempC) ? 25.0f : currentTempC;
+                learnStepStartTime = millis();
+                learnPhaseStartTime = millis();
+                learnPeakTemp = 0;
+                learnTargetCrossTime = 0;
+                learnRateAtCutoff = 0;
+                learnPrevTemp = isnan(currentTempC) ? 25.0f : currentTempC;
+                learnPrevTime = millis();
+                learnModeActive = true;
+
+                float target = steps[0].targetTemp;
+                learnPhase = (target < learnPrevTemp) ? LEARN_COOLING : LEARN_HEATING;
+                Serial.print("Learn mode started: ");
+                Serial.print(numSteps);
+                Serial.println(" steps");
+              } else {
+                Serial.println("Failed to allocate learned array");
+                learnModeEnabled = false;
+              }
+            } else {
+              learnModeEnabled = false;
+            }
+          }
         } else {
-          inProfileSelect = true; profileSelectItem = 0; profileSelectForLearn = true;
-          lastInProfileSelect = false; lastProfileSelectItem = -1;
-          tft.fillScreen(TFT_BLACK);
+          learnModeActive = false;
+          learnPhase = LEARN_IDLE;
+          stopAllOutputs();
         }
 
       } else if (selectedOption == 3) {
@@ -925,24 +756,6 @@ void loop() {
       lastTestEscOn = testEscOn;
       lastTestEscPct = testEscPct;
     }
-  } else if (inProfileSelect) {
-    bool changed = (inProfileSelect != lastInProfileSelect) ||
-                   (profileSelectItem != lastProfileSelectItem) ||
-                   (strcmp(tc_str, lastTcStr) != 0);
-    if (changed) {
-      drawProfileSelect();
-      lastInProfileSelect = inProfileSelect;
-      lastProfileSelectItem = profileSelectItem;
-      strcpy(lastTcStr, tc_str);
-    }
-  } else if (inUsbPrompt) {
-    bool changed = (inUsbPrompt != lastInUsbPrompt) ||
-                   (usbPromptItem != lastUsbPromptItem);
-    if (changed) {
-      drawUsbPrompt();
-      lastInUsbPrompt = inUsbPrompt;
-      lastUsbPromptItem = usbPromptItem;
-    }
   } else {
     bool needsRedraw = (millis() - lastDrawTime >= DRAW_INTERVAL) ||
                        (fabs(currentTempC - lastTempC) > 1.0) ||
@@ -961,9 +774,7 @@ void loop() {
                        (dwelling) ||  // redraw during dwell for countdown
                        (currentStep != lastCurrentStep) ||
                        (abs(currentInternalTemp - lastInternalTemp) > 2) ||
-                       (inSettings != lastInSettings) ||
-                       (inProfileSelect != lastInProfileSelect) ||
-                       (inUsbPrompt != lastInUsbPrompt);
+                       (inSettings != lastInSettings);
 
     if (needsRedraw) {
       drawMenu(setpointTemp);
@@ -984,8 +795,6 @@ void loop() {
       lastCurrentStep = currentStep;
       lastInternalTemp = currentInternalTemp;
       lastInSettings = inSettings;
-      lastInProfileSelect = inProfileSelect;
-      lastInUsbPrompt = inUsbPrompt;
     }
   }
 
@@ -1046,110 +855,21 @@ void readPicoT() {
   average = total / numReadings;
 }
 
-// ── EEPROM functions ──────────────────────────────────────────────────────────
-
-void loadSettingsFromEEPROM() {
-  EESettings& s = eedata.settings;
-  if (s.tcSmoothing >= 0.1f && s.tcSmoothing <= 1.0f) tcSmoothing = s.tcSmoothing;
-  if (s.tcOffset >= -10.0f && s.tcOffset <= 10.0f)     tcOffset = s.tcOffset;
-  if (s.tcMedianWindow >= 1 && s.tcMedianWindow <= MAX_MEDIAN_WINDOW) {
-    tcMedianWindow = s.tcMedianWindow;
-    tcBufferIdx = 0; tcBufferCount = 0;
-  }
-  Serial.printf("Settings from EEPROM: smoothing=%.1f offset=%.1f median=%d\n",
-                tcSmoothing, tcOffset, tcMedianWindow);
-}
-
-void saveSettingsToEEPROM() {
-  eedata.settings.tcSmoothing    = tcSmoothing;
-  eedata.settings.tcOffset       = tcOffset;
-  eedata.settings.tcMedianWindow = (uint16_t)tcMedianWindow;
-  EEPROM.put(0, eedata);
-  pendingEEPROMCommit = true;
-  Serial.println("Settings staged for EEPROM commit");
-}
-
-// Safely commit EEPROM from Core 0 without deadlocking the PIO USB host on Core 1.
-// Must only be called from loop() (Core 0), never from setup() or callbacks.
-void commitEEPROMSafe() {
-  // Wait until loop1() is running — guarantees setup1() (USB init) is complete.
-  // Only blocks on the very first commit after a cold boot with uninitialised EEPROM.
-  while (!core1Ready) { tight_loop_contents(); }
-
-  // Ask Core 1 to exit USBHost.task() and park in a spin loop with interrupts enabled.
-  // Once core1PauseAck is true, Core 1 is NOT inside any TinyUSB critical section,
-  // so the multicore lockout used by EEPROM.commit() can be acquired immediately.
+// Ask Core 1 to park in a spin loop so Core 0 can drive tuh_task() alone.
+// Core 1 interrupts remain enabled so PIO USB IRQs still queue events.
+void pauseCore1() {
   core1PauseRequest = true;
   while (!core1PauseAck) { tight_loop_contents(); }
-
-  EEPROM.commit();
-
-  // Release Core 1 and wait for it to resume normal USB polling.
+}
+void resumeCore1() {
   core1PauseRequest = false;
   while (core1PauseAck) { tight_loop_contents(); }
-
-  Serial.println("EEPROM committed");
 }
-
-void initEEPROM() {
-  EEPROM.begin(512);
-  EEPROM.get(0, eedata);
-  if (eedata.magic != EEPROM_MAGIC) {
-    eedata.magic = EEPROM_MAGIC;
-    eedata.settings.tcSmoothing    = 0.3f;
-    eedata.settings.tcOffset       = 0.0f;
-    eedata.settings.tcMedianWindow = 7;
-    for (int slot = 0; slot < EEPROM_PROFILES; slot++) {
-      snprintf(eedata.profiles[slot].name, 12, "%d", slot + 1);
-      eedata.profiles[slot].numSteps = 0;
-    }
-    EEPROM.put(0, eedata);
-    // Commit deferred to loop() — never call EEPROM.commit() from setup()
-    // while Core 1 is initialising USB; the multicore lockout will deadlock.
-    pendingEEPROMCommit = true;
-    Serial.println("EEPROM defaults staged, commit deferred to loop()");
-  }
-  loadSettingsFromEEPROM();
-}
-
-void loadProfileFromEEPROM(int slot) {
-  EEProfile& ep = eedata.profiles[slot];
-  freeProfile();
-  // Treat out-of-range numSteps as corrupt/empty — guards against garbage EEPROM
-  if (ep.numSteps == 0 || ep.numSteps > EEPROM_MAX_STEPS) {
-    Serial.printf("Profile slot %d: empty or corrupt (numSteps=%d)\n", slot + 1, ep.numSteps);
-    return;
-  }
-  steps = (RampStep*)malloc(ep.numSteps * sizeof(RampStep));
-  if (!steps) {
-    Serial.println("Failed to allocate profile memory");
-    return;
-  }
-  for (int i = 0; i < ep.numSteps; i++) {
-    steps[i].targetTemp = ep.steps[i].targetTemp;
-    steps[i].dwellMs    = ep.steps[i].dwellMs;
-  }
-  numSteps = ep.numSteps;
-  Serial.printf("Profile slot %d loaded: %d steps\n", slot + 1, numSteps);
-}
-
-void saveProfileToEEPROM(int slot) {
-  EEProfile& ep = eedata.profiles[slot];
-  ep.numSteps = (uint8_t)(numSteps < EEPROM_MAX_STEPS ? numSteps : EEPROM_MAX_STEPS);
-  for (int i = 0; i < ep.numSteps; i++) {
-    ep.steps[i].targetTemp = steps[i].targetTemp;
-    ep.steps[i].dwellMs    = (uint32_t)steps[i].dwellMs;
-  }
-  EEPROM.put(0, eedata);
-  pendingEEPROMCommit = true;
-  Serial.printf("Profile slot %d staged for EEPROM commit (%d steps)\n", slot + 1, ep.numSteps);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 
 void loadSettings() {
+  pauseCore1();
   File32 f;
-  if (!f.open(&fatfs, "settings.csv", O_RDONLY)) return;
+  if (!f.open(&fatfs, "settings.csv", O_RDONLY)) { resumeCore1(); return; }
 
   // Skip header
   while (f.available() && f.read() != '\n');
@@ -1174,20 +894,22 @@ void loadSettings() {
       tcBufferIdx = 0;
       tcBufferCount = 0;
     }
-    Serial.print("Settings loaded from USB: smoothing=");
+    Serial.print("Settings loaded: smoothing=");
     Serial.print(tcSmoothing);
     Serial.print(" offset=");
     Serial.print(tcOffset);
     Serial.print(" median=");
     Serial.println(tcMedianWindow);
   }
+  resumeCore1();
 }
 
 void saveSettings() {
-  fatfs.remove("settings.csv");
+  pauseCore1();
   File32 f;
   if (!f.open(&fatfs, "settings.csv", O_WRITE | O_CREAT | O_TRUNC)) {
     Serial.println("Error saving settings");
+    resumeCore1();
     return;
   }
   f.println("smoothing,offset,median");
@@ -1198,9 +920,11 @@ void saveSettings() {
   f.println(tcMedianWindow);
   f.close();
   Serial.println("Settings saved.");
+  resumeCore1();
 }
 
 void readProfile() {
+  pauseCore1();
   free(steps);
   steps = NULL;
   numSteps = 0;
@@ -1208,6 +932,8 @@ void readProfile() {
   File32 profileFile;
   if (!profileFile.open(&fatfs, "profile.csv", O_RDONLY)) {
     Serial.println("Error opening profile.csv");
+    readProfileEnabled = false;
+    resumeCore1();
     return;
   }
 
@@ -1229,6 +955,8 @@ void readProfile() {
   if (lineCount == 0) {
     Serial.println("No valid steps in profile.csv");
     profileFile.close();
+    readProfileEnabled = false;
+    resumeCore1();
     return;
   }
 
@@ -1236,6 +964,8 @@ void readProfile() {
   if (!steps) {
     Serial.println("Failed to allocate memory for profile");
     profileFile.close();
+    readProfileEnabled = false;
+    resumeCore1();
     return;
   }
 
@@ -1268,15 +998,15 @@ void readProfile() {
   Serial.print("Profile loaded: ");
   Serial.print(numSteps);
   Serial.println(" steps");
+  resumeCore1();
 }
 
 void loadLearnedData() {
+  pauseCore1();
   freeLearned();
 
-  if (!usbFsReady) return;
-
   File32 f;
-  if (!f.open(&fatfs, "learned.csv", O_RDONLY)) return;
+  if (!f.open(&fatfs, "learned.csv", O_RDONLY)) { resumeCore1(); return; }
 
   while (f.available() && f.read() != '\n');
 
@@ -1294,10 +1024,10 @@ void loadLearnedData() {
     if (idx > 0) count++;
   }
 
-  if (count == 0) { f.close(); return; }
+  if (count == 0) { f.close(); resumeCore1(); return; }
 
   learned = (LearnedStep*)malloc(count * sizeof(LearnedStep));
-  if (!learned) { f.close(); return; }
+  if (!learned) { f.close(); resumeCore1(); return; }
 
   f.seekSet(dataStart);
   while (f.available() && numLearned < count) {
@@ -1322,17 +1052,16 @@ void loadLearnedData() {
   Serial.print("Learned data loaded: ");
   Serial.print(numLearned);
   Serial.println(" steps");
+  resumeCore1();
 }
 
 void saveLearnedData() {
-  if (!usbFsReady) {
-    Serial.println("USB not ready — learned data not saved");
-    return;
-  }
+  pauseCore1();
   fatfs.remove("learned.csv");
   File32 f;
   if (!f.open(&fatfs, "learned.csv", O_WRITE | O_CREAT | O_TRUNC)) {
     Serial.println("Error saving learned data");
+    resumeCore1();
     return;
   }
 
@@ -1350,6 +1079,7 @@ void saveLearnedData() {
   f.close();
   learnedDataLoaded = true;
   Serial.println("Learned data saved.");
+  resumeCore1();
 }
 
 float tickLearnMode() {
@@ -1663,92 +1393,16 @@ void drawSettings() {
   tft.endWrite();
 }
 
-void drawProfileSelect() {
-  tft.startWrite();
-  tft.setTextSize(menuTextSize);
-
-  // Title
-  drawPaddedStr(11, 13, "PROFILE SELECT", 25, TFT_YELLOW, TFT_BLACK);
-
-  // Slots 0–4
-  for (int slot = 0; slot < EEPROM_PROFILES; slot++) {
-    int y = 45 + slot * 30;
-    uint16_t bg = (profileSelectItem == slot) ? TFT_BLUE : TFT_BLACK;
-    tft.fillRect(10, y, 460, 22, bg);
-    char rowText[30];
-    EEProfile& ep = eedata.profiles[slot];
-    if (ep.numSteps == 0) {
-      snprintf(rowText, sizeof(rowText), "%s: (empty)", ep.name);
-    } else {
-      snprintf(rowText, sizeof(rowText), "%s: %d steps", ep.name, ep.numSteps);
-    }
-    drawPaddedStr(11, y + 2, rowText, 28, textColour, bg);
-  }
-
-  // Back (y=195)
-  uint16_t bkBg = (profileSelectItem == 5) ? TFT_BLUE : TFT_BLACK;
-  tft.fillRect(10, 195, 460, 22, bkBg);
-  drawPaddedStr(11, 197, "< Back", 28, textColour, bkBg);
-
-  // Hint
-  drawPaddedStr(11, 260, "Rotate to select, press to confirm", 38, TFT_DARKGREY, TFT_BLACK);
-
-  tft.setTextSize(textSize);
-
-  // TC temp at bottom
-  drawPaddedStr(11, 290, tc_str, 8, textColour, TFT_BLACK);
-
-  tft.endWrite();
-}
-
-void drawUsbPrompt() {
-  tft.startWrite();
-  tft.setTextSize(menuTextSize);
-
-  if (usbPromptType == 0) {
-    // Settings yes/no
-    drawPaddedStr(11, 13, "LOAD FROM USB?", 25, TFT_YELLOW, TFT_BLACK);
-    drawPaddedStr(11, 60, "Settings found on flash drive.", 35, textColour, TFT_BLACK);
-
-    uint16_t yesBg = (usbPromptItem == 0) ? TFT_BLUE : TFT_BLACK;
-    uint16_t noBg  = (usbPromptItem == 1) ? TFT_BLUE : TFT_BLACK;
-    tft.fillRect(10, 105, 200, 22, yesBg);
-    drawPaddedStr(11, 107, "Yes", 20, textColour, yesBg);
-    tft.fillRect(10, 135, 200, 22, noBg);
-    drawPaddedStr(11, 137, "No", 20, textColour, noBg);
-
-  } else {
-    // Profile slot select
-    drawPaddedStr(11, 13, "IMPORT PROFILE", 25, TFT_YELLOW, TFT_BLACK);
-    drawPaddedStr(11, 60, "Save profile.csv to slot:", 35, textColour, TFT_BLACK);
-
-    for (int slot = 0; slot < EEPROM_PROFILES; slot++) {
-      int y = 90 + slot * 30;
-      uint16_t bg = (usbPromptItem == slot) ? TFT_BLUE : TFT_BLACK;
-      tft.fillRect(10, y, 460, 22, bg);
-      char rowText[30];
-      snprintf(rowText, sizeof(rowText), "Slot %d: %s", slot + 1, eedata.profiles[slot].name);
-      drawPaddedStr(11, y + 2, rowText, 28, textColour, bg);
-    }
-  }
-
-  drawPaddedStr(11, 260, "Rotate to select, press to confirm", 38, TFT_DARKGREY, TFT_BLACK);
-
-  tft.endWrite();
-}
-
-// Profile staircase graph — occupies the free area right of the lower-half sensor labels.
-// Graph zone: x=162..476, y=152..310  (314×158 px, never drawn by any other element).
-// Called from inside drawMenu()'s startWrite/endWrite block — no startWrite here.
+// Draws a staircase profile graph in the free area right of the lower sensor labels.
+// Graph zone: x=162..476, y=152..310.  Call from inside drawMenu()'s startWrite/endWrite block.
 void drawProfileGraph() {
-  // Pixel boundaries
-  const int16_t GX  = 162;  // left of graph zone
-  const int16_t GY  = 152;  // top of graph zone
-  const int16_t GRX = 476;  // right of graph zone
-  const int16_t GBY = 310;  // bottom of graph zone
+  const int16_t GX  = 162;
+  const int16_t GY  = 152;
+  const int16_t GRX = 476;
+  const int16_t GBY = 310;
   const int16_t GW  = GRX - GX;   // 314
   const int16_t GH  = GBY - GY;   // 158
-  const int16_t YLW = 24;          // width reserved for Y-axis labels (textSize1 = 6px/ch, 4 chars)
+  const int16_t YLW = 24;          // width reserved for Y-axis labels
   const int16_t X0  = GX + YLW;   // 186 — left edge of data area
   const int16_t Y0  = GBY;        // 310 — bottom of data area
   const int16_t PAW = GRX - X0;   // 290 — plot width
@@ -1756,7 +1410,7 @@ void drawProfileGraph() {
   const int16_t PAH = Y0 - TOP;   // 146 — plot height
 
   tft.fillRect(GX, GY, GW, GH, TFT_BLACK);
-  tft.setTextSize(1);  // 6×8 px per char
+  tft.setTextSize(1);
 
   if (steps == NULL || numSteps == 0) {
     const char* msg = "no profile loaded";
@@ -1813,17 +1467,15 @@ void drawProfileGraph() {
     } else if (i == currentStep) {
       col = dwelling ? TFT_CYAN : TFT_GREEN;
     } else {
-      col = 0xC618;  // TFT_LIGHTGREY — future steps
+      col = 0xC618;  // light grey — future steps
     }
 
-    // Vertical connector at left edge of this step
     if (prevY >= 0 && prevY != yStep) {
       int16_t vTop = (prevY < yStep) ? prevY : yStep;
       int16_t vBot = (prevY < yStep) ? yStep : prevY;
       tft.drawFastVLine(x1, vTop, vBot - vTop + 1, TFT_DARKGREY);
     }
 
-    // Horizontal step line (2 px thick for visibility)
     tft.drawFastHLine(x1, yStep, x2 - x1, col);
     if (yStep > TOP)
       tft.drawFastHLine(x1, yStep - 1, x2 - x1, col);
@@ -1831,7 +1483,7 @@ void drawProfileGraph() {
     prevY = yStep;
   }
 
-  // Current temperature — dotted orange line across plot area
+  // Current temperature — dotted orange line
   if (!isnan(currentTempC) && currentTempC >= yMin && currentTempC <= yMax) {
     int16_t yTc = (int16_t)roundf(Y0 - (currentTempC - yMin) / yRange * (float)PAH);
     if (yTc < TOP) yTc = TOP;
@@ -1843,7 +1495,6 @@ void drawProfileGraph() {
         tft.drawPixel(X0 + dx + 1, yTc, TFT_ORANGE);
     }
 
-    // Orange label on left margin
     snprintf(lbl, sizeof(lbl), "%.0f", currentTempC);
     int16_t lblY = yTc - 4;
     if (lblY < GY)      lblY = GY;
@@ -1970,7 +1621,7 @@ void drawMenu(float setpointTemp) {
     strcpy(lastTcStr, tc_str);
   }
 
-  // Profile graph — right side of lower half (x=162..476, y=152..310)
+  // Profile graph (x=162..476, y=152..310)
   {
     static int   pgLastNumSteps = -99;
     static int   pgLastStep     = -1;
@@ -1979,7 +1630,7 @@ void drawMenu(float setpointTemp) {
     static float pgLastTempC    = -999.0f;
 
     bool graphRunning = rampActive || learnModeActive;
-    bool graphRedraw  = (lastSelectedOption == -1) ||          // screen was just cleared
+    bool graphRedraw  = (lastSelectedOption == -1) ||
                         (numSteps != pgLastNumSteps)  ||
                         (currentStep != pgLastStep)   ||
                         (dwelling != pgLastDwelling)  ||
@@ -2000,6 +1651,7 @@ void drawMenu(float setpointTemp) {
 }
 
 void logData(float setpointTemp) {
+  pauseCore1();
   File32 f;
   if (f.open(&fatfs, logFileName, O_WRITE | O_CREAT | O_APPEND)) {
     unsigned long timestamp = millis();
@@ -2031,6 +1683,7 @@ void logData(float setpointTemp) {
   } else {
     Serial.println("Error opening log file.");
   }
+  resumeCore1();
 }
 
 // ============================================================
@@ -2049,12 +1702,11 @@ void setup1() {
 }
 
 void loop1() {
-  core1Ready = true;  // signal: setup1() is complete, safe to pause this core
   if (core1PauseRequest) {
     core1PauseAck = true;
     while (core1PauseRequest) { tight_loop_contents(); }
     core1PauseAck = false;
-    return;  // skip USBHost.task() for this iteration; Core 0 owns the bus
+    return;
   }
   USBHost.task();
 }
