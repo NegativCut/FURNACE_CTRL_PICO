@@ -1,6 +1,6 @@
 # furnace_ctrl_pico — Claude Session Notes
 
-Last updated: 2026-02-26
+Last updated: 2026-02-27
 
 ---
 
@@ -44,7 +44,8 @@ SD card socket (D12–D15, D19) removed. SPI1 dropped from firmware.
 - Temperature pipeline: raw → +tcOffset → medianFilter (circular, 1–128) → EMA → `currentTempC`
 - 4 main menu options: Logging, Profile run, Learn mode, Settings
 - Settings loaded from `settings.csv` on USB mount; saved back to `settings.csv` on Settings→Back (deferred to next loop() iteration via `pendingSaveSettings` flag)
-- Profile loaded from `profile.csv` on USB mount or when toggled ON
+- Profile files: any `profile*.csv` in USB root (up to 6); selected via sub-menu
+- Profile selector opened by pressing Option 1 (Profile) or Option 2 (Learn) when not running
 - Learned data saved/loaded from `learned.csv`
 - Log files named `log_N.csv` where N = mount count since power-on (no existence-check loop)
 - Main menu shows staircase profile graph (x=162..476, y=152..310); past=grey, current=green/cyan, future=light grey; dotted orange = current temp
@@ -121,6 +122,7 @@ Only `earlyCutoff` is read back by profile mode. The rest are stored for future 
 ## Remaining Opportunities
 - [ ] Use `rateOfRise` at cutoff to improve earlyCutoff prediction (stored but unused)
 - [ ] Proportional blower speed during coast (currently full-on or off)
+- [ ] Profile selector: when 0 profiles found, "No profiles on USB" row and Back row overlap at y=45 (Back is drawn second and overwrites) — minor UX issue
 
 ---
 

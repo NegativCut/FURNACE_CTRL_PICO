@@ -78,6 +78,7 @@
 Servo escServo;
 TFT_eSPI tft = TFT_eSPI();
 
+#include <strings.h>            // strcasecmp / strncasecmp (POSIX)
 #include "hardware/clocks.h"
 #include "hardware/pio.h"
 #include "SdFat_Adafruit_Fork.h"  // MUST be before pio_usb.h and Adafruit_TinyUSB.h
@@ -184,6 +185,18 @@ float startTemp = 0;
 bool rampActive = false;
 bool rampHeating = true;
 
+#define MAX_PROFILE_FILES 6
+char profileFileNames[MAX_PROFILE_FILES][24];   // filenames in root
+int  profileFileCount = 0;
+
+bool inProfileSelect       = false;
+bool profileSelectForLearn = false;   // true → start learn, not run
+int  profileSelectItem     = 0;       // 0..N-1 = file, N = Back
+
+// Display tracking for profile selector
+bool lastInProfileSelect   = false;
+int  lastProfileSelectItem = -1;
+
 // Dwell state
 bool dwelling = false;
 bool dwellIsHeating = false;
@@ -243,17 +256,19 @@ int lastInternalTemp = 0;
 char lastTcStr[10];
 
 // Forward declarations
-void readProfile();
+void readProfile(const char* filename);
 void loadLearnedData();
 void saveLearnedData();
 void loadSettings();
 void saveSettings();
+void scanProfiles();
 void pauseCore1();
 void resumeCore1();
 float tickLearnMode();
 void drawMenu(float setpointTemp);
 void drawProfileGraph();
 void drawSettings();
+void drawProfileSelect();
 void stopAllOutputs();
 void freeProfile();
 void freeLearned();
@@ -433,6 +448,9 @@ void loop() {
         // Navigate settings items
         settingsItem = ((settingsItem + delta) % NUM_SETTINGS + NUM_SETTINGS) % NUM_SETTINGS;
       }
+    } else if (inProfileSelect) {
+      int n_items = profileFileCount + 1;   // files + Back
+      profileSelectItem = ((profileSelectItem + delta) % n_items + n_items) % n_items;
     } else {
       selectedOption = ((selectedOption + delta) % NUM_OPTIONS + NUM_OPTIONS) % NUM_OPTIONS;
     }
@@ -451,6 +469,7 @@ void loop() {
       usbFsReady = true;
       Serial.println("[USB] FAT32 mounted");
       loadSettings();
+      scanProfiles();
       // Use a static mount counter for log naming — avoids the exists() loop
       // which does N rapid USB reads and can trigger the tuh_task() race condition.
       // Logs reset to log_0 on power cycle; pull data before cycling power.
@@ -465,15 +484,6 @@ void loop() {
         f.close();
       }
       resumeCore1();
-      if (readProfileEnabled) {
-        readProfile();
-        loadLearnedData();
-        if (numSteps > 0 && !rampActive) {
-          currentStep = 0;
-          startTemp = isnan(currentTempC) ? 25.0f : currentTempC;
-          rampActive = true; rampHeating = true;
-        }
-      }
     } else {
       Serial.println("[USB] FAT32 mount failed — needs FAT32 formatted drive");
       usbFsReady = false;
@@ -484,6 +494,8 @@ void loop() {
     usbFsReady = false;
     Serial.println("[USB] Flash drive removed");
     loggingEnabled = false;   // can't log without flash
+    inProfileSelect = false;
+    profileFileCount = 0;
     // Profile/learn continue — data is already in RAM
   }
   // ───────────────────────────────────────────────────────────
@@ -543,6 +555,50 @@ void loop() {
         settingsEditing = !settingsEditing;
       }
 
+    } else if (inProfileSelect) {
+      if (profileSelectItem == profileFileCount) {    // Back
+        inProfileSelect = false;
+        tft.fillScreen(TFT_BLACK); lastSelectedOption = -1;
+      } else {
+        const char* fname = profileFileNames[profileSelectItem];
+        if (!profileSelectForLearn) {
+          readProfileEnabled = true;
+          learnModeEnabled = false; learnModeActive = false; learnPhase = LEARN_IDLE;
+          readProfile(fname);
+          loadLearnedData();
+          if (numSteps > 0) {
+            currentStep = 0; startTemp = isnan(currentTempC) ? 25.0f : currentTempC;
+            rampActive = true; rampHeating = true;
+          } else { readProfileEnabled = false; }
+        } else {
+          learnModeEnabled = true; readProfileEnabled = false; rampActive = false;
+          readProfile(fname);
+          loadLearnedData();
+          // Ensure learned array is allocated and sized for all steps
+          if (numSteps > 0 && (learned == NULL || numLearned < numSteps)) {
+            int existing = numLearned;
+            LearnedStep* tmp = (LearnedStep*)realloc(learned, numSteps * sizeof(LearnedStep));
+            if (tmp) {
+              learned = tmp;
+              for (int i = existing; i < numSteps; i++) memset(&learned[i], 0, sizeof(LearnedStep));
+              numLearned = numSteps;
+            } else {
+              learnModeEnabled = false;
+            }
+          }
+          if (learnModeEnabled && numSteps > 0) {
+            currentStep = 0; startTemp = isnan(currentTempC) ? 25.0f : currentTempC;
+            learnStepStartTime = learnPhaseStartTime = millis();
+            learnPeakTemp = 0; learnTargetCrossTime = 0; learnRateAtCutoff = 0;
+            learnPrevTemp = startTemp; learnPrevTime = millis();
+            learnModeActive = true;
+            learnPhase = (steps[0].targetTemp < learnPrevTemp) ? LEARN_COOLING : LEARN_HEATING;
+          } else if (numSteps == 0) { learnModeEnabled = false; }
+        }
+        inProfileSelect = false;
+        tft.fillScreen(TFT_BLACK); lastSelectedOption = -1;
+      }
+
     } else {
       // Main menu button handling
       if (selectedOption == 0) {
@@ -552,82 +608,27 @@ void loop() {
         Serial.println(loggingEnabled ? "ON" : "OFF");
 
       } else if (selectedOption == 1) {
-        // Toggle profile run
-        readProfileEnabled = !readProfileEnabled;
-        Serial.print("Profile: ");
-        Serial.println(readProfileEnabled ? "ON" : "OFF");
-        if (readProfileEnabled) {
-          learnModeEnabled = false;
-          learnModeActive = false;
-          learnPhase = LEARN_IDLE;
-          if (usbFsReady) {
-            readProfile();
-            loadLearnedData();
-            if (numSteps > 0) {
-              currentStep = 0;
-              startTemp = isnan(currentTempC) ? 25.0f : currentTempC;
-              rampActive = true;
-              rampHeating = true;
-            }
-          }
+        if (rampActive || learnModeActive) {
+          readProfileEnabled = false; rampActive = false; dwelling = false;
+          learnModeEnabled = false; learnModeActive = false; learnPhase = LEARN_IDLE;
+          freeProfile(); stopAllOutputs();
         } else {
-          rampActive = false;
-          dwelling = false;
-          freeProfile();
-          stopAllOutputs();
+          scanProfiles();
+          inProfileSelect = true; profileSelectItem = 0; profileSelectForLearn = false;
+          tft.fillScreen(TFT_BLACK);
+          lastInProfileSelect = false; lastProfileSelectItem = -1;
         }
 
       } else if (selectedOption == 2) {
-        // Toggle learn mode
-        learnModeEnabled = !learnModeEnabled;
-        Serial.print("Learn: ");
-        Serial.println(learnModeEnabled ? "ON" : "OFF");
-        if (learnModeEnabled) {
-          readProfileEnabled = false;
-          rampActive = false;
-          if (usbFsReady) {
-            readProfile();
-            if (numSteps > 0) {
-              loadLearnedData();
-              LearnedStep* newLearned = (LearnedStep*)malloc(numSteps * sizeof(LearnedStep));
-              if (newLearned) {
-                memset(newLearned, 0, numSteps * sizeof(LearnedStep));
-                int copyCount = (numLearned < numSteps) ? numLearned : numSteps;
-                for (int i = 0; i < copyCount; i++) {
-                  newLearned[i] = learned[i];
-                }
-                free(learned);
-                learned = newLearned;
-                numLearned = copyCount;
-
-                currentStep = 0;
-                startTemp = isnan(currentTempC) ? 25.0f : currentTempC;
-                learnStepStartTime = millis();
-                learnPhaseStartTime = millis();
-                learnPeakTemp = 0;
-                learnTargetCrossTime = 0;
-                learnRateAtCutoff = 0;
-                learnPrevTemp = isnan(currentTempC) ? 25.0f : currentTempC;
-                learnPrevTime = millis();
-                learnModeActive = true;
-
-                float target = steps[0].targetTemp;
-                learnPhase = (target < learnPrevTemp) ? LEARN_COOLING : LEARN_HEATING;
-                Serial.print("Learn mode started: ");
-                Serial.print(numSteps);
-                Serial.println(" steps");
-              } else {
-                Serial.println("Failed to allocate learned array");
-                learnModeEnabled = false;
-              }
-            } else {
-              learnModeEnabled = false;
-            }
-          }
+        if (learnModeActive || rampActive) {
+          learnModeEnabled = false; learnModeActive = false; learnPhase = LEARN_IDLE;
+          readProfileEnabled = false; rampActive = false; dwelling = false;
+          freeProfile(); stopAllOutputs();
         } else {
-          learnModeActive = false;
-          learnPhase = LEARN_IDLE;
-          stopAllOutputs();
+          scanProfiles();
+          inProfileSelect = true; profileSelectItem = 0; profileSelectForLearn = true;
+          tft.fillScreen(TFT_BLACK);
+          lastInProfileSelect = false; lastProfileSelectItem = -1;
         }
 
       } else if (selectedOption == 3) {
@@ -756,6 +757,16 @@ void loop() {
       lastTestEscOn = testEscOn;
       lastTestEscPct = testEscPct;
     }
+  } else if (inProfileSelect) {
+    bool psChanged = (inProfileSelect != lastInProfileSelect) ||
+                     (profileSelectItem != lastProfileSelectItem) ||
+                     strcmp(tc_str, lastTcStr) != 0;
+    if (psChanged) {
+      drawProfileSelect();
+      lastInProfileSelect = inProfileSelect;
+      lastProfileSelectItem = profileSelectItem;
+      strcpy(lastTcStr, tc_str);
+    }
   } else {
     bool needsRedraw = (millis() - lastDrawTime >= DRAW_INTERVAL) ||
                        (fabs(currentTempC - lastTempC) > 1.0) ||
@@ -774,7 +785,8 @@ void loop() {
                        (dwelling) ||  // redraw during dwell for countdown
                        (currentStep != lastCurrentStep) ||
                        (abs(currentInternalTemp - lastInternalTemp) > 2) ||
-                       (inSettings != lastInSettings);
+                       (inSettings != lastInSettings) ||
+                       (inProfileSelect != lastInProfileSelect);
 
     if (needsRedraw) {
       drawMenu(setpointTemp);
@@ -795,6 +807,7 @@ void loop() {
       lastCurrentStep = currentStep;
       lastInternalTemp = currentInternalTemp;
       lastInSettings = inSettings;
+      lastInProfileSelect = inProfileSelect;
     }
   }
 
@@ -923,15 +936,56 @@ void saveSettings() {
   resumeCore1();
 }
 
-void readProfile() {
+void scanProfiles() {
+  profileFileCount = 0;
+  if (!usbFsReady) return;
+  pauseCore1();
+  File32 root;
+  File32 entry;
+  if (root.open(&fatfs, "/", O_RDONLY)) {
+    while (entry.openNext(&root, O_RDONLY)) {
+      if (!entry.isDir()) {
+        char name[24];
+        entry.getName(name, sizeof(name));
+        int nl = strlen(name);
+        if (nl >= 11 &&
+            strncasecmp(name, "profile", 7) == 0 &&
+            strcasecmp(name + nl - 4, ".csv") == 0) {
+          if (profileFileCount < MAX_PROFILE_FILES) {
+            strncpy(profileFileNames[profileFileCount], name, 23);
+            profileFileNames[profileFileCount][23] = '\0';
+            profileFileCount++;
+          }
+        }
+      }
+      entry.close();
+    }
+    root.close();
+  }
+  resumeCore1();
+  // Insertion sort — no USB access needed
+  for (int i = 1; i < profileFileCount; i++) {
+    char tmp[24];
+    strcpy(tmp, profileFileNames[i]);
+    int j = i - 1;
+    while (j >= 0 && strcasecmp(profileFileNames[j], tmp) > 0) {
+      strcpy(profileFileNames[j + 1], profileFileNames[j]);
+      j--;
+    }
+    strcpy(profileFileNames[j + 1], tmp);
+  }
+  Serial.print("[USB] Found "); Serial.print(profileFileCount); Serial.println(" profile(s)");
+}
+
+void readProfile(const char* filename) {
   pauseCore1();
   free(steps);
   steps = NULL;
   numSteps = 0;
 
   File32 profileFile;
-  if (!profileFile.open(&fatfs, "profile.csv", O_RDONLY)) {
-    Serial.println("Error opening profile.csv");
+  if (!profileFile.open(&fatfs, filename, O_RDONLY)) {
+    Serial.print("Error opening profile: "); Serial.println(filename);
     readProfileEnabled = false;
     resumeCore1();
     return;
@@ -953,7 +1007,7 @@ void readProfile() {
   }
 
   if (lineCount == 0) {
-    Serial.println("No valid steps in profile.csv");
+    Serial.print("No valid steps in "); Serial.println(filename);
     profileFile.close();
     readProfileEnabled = false;
     resumeCore1();
@@ -1388,6 +1442,41 @@ void drawSettings() {
   tft.setTextSize(textSize);
 
   // Still show TC temp at bottom
+  drawPaddedStr(11, 290, tc_str, 8, textColour, TFT_BLACK);
+
+  tft.endWrite();
+}
+
+void drawProfileSelect() {
+  tft.startWrite();
+  tft.setTextSize(menuTextSize);
+
+  // Title
+  drawPaddedStr(11, 13, "SELECT PROFILE", 22, TFT_YELLOW, TFT_BLACK);
+
+  if (profileFileCount == 0) {
+    tft.fillRect(10, 45, 350, 22, TFT_BLACK);
+    drawPaddedStr(11, 47, "No profiles on USB", 22, TFT_DARKGREY, TFT_BLACK);
+  } else {
+    for (int i = 0; i < profileFileCount; i++) {
+      int y = 45 + i * 30;
+      uint16_t bg = (profileSelectItem == i) ? TFT_BLUE : TFT_BLACK;
+      tft.fillRect(10, y, 350, 22, bg);
+      drawPaddedStr(11, y + 2, profileFileNames[i], 22, textColour, bg);
+    }
+  }
+
+  // Back row
+  int backY = 45 + profileFileCount * 30;
+  uint16_t backBg = (profileSelectItem == profileFileCount) ? TFT_BLUE : TFT_BLACK;
+  tft.fillRect(10, backY, 350, 22, backBg);
+  drawPaddedStr(11, backY + 2, "< Back", 22, textColour, backBg);
+
+  // Hint
+  drawPaddedStr(11, 260, "Rotate to select, press to confirm  ", 38, TFT_DARKGREY, TFT_BLACK);
+
+  // TC temp
+  tft.setTextSize(textSize);
   drawPaddedStr(11, 290, tc_str, 8, textColour, TFT_BLACK);
 
   tft.endWrite();
