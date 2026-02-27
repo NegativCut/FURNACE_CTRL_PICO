@@ -140,6 +140,7 @@ bool          usbFsReady            = false;   // FAT volume successfully mounte
 // Core 1 pause protocol — prevents tuh_task() race during USB file I/O
 volatile bool core1PauseRequest = false;
 volatile bool core1PauseAck     = false;
+bool          core1PauseTimeout = false;   // set when Core 1 did not ack within 1 s
 
 unsigned long lastLogTime = 0;
 const unsigned long logInterval = LOG_INTERVAL_MS;
@@ -476,14 +477,16 @@ void loop() {
       static int logMountCount = 0;
       snprintf(logFileName, sizeof(logFileName), "log_%d.csv", logMountCount++);
       pauseCore1();
-      File32 f;
-      if (f.open(&fatfs, logFileName, O_WRITE | O_CREAT | O_TRUNC)) {
-        Serial.print("[USB] Log: "); Serial.println(logFileName);
-        f.println("Timestamp,PotValue,EncoderValue,InternalTemp,ThermocoupleTemp,"
-                  "SetpointTemp,SSR_Esc,SSR_Relay,Step,LearnPhase,Dwelling");
-        f.close();
+      if (!core1PauseTimeout) {
+        File32 f;
+        if (f.open(&fatfs, logFileName, O_WRITE | O_CREAT | O_TRUNC)) {
+          Serial.print("[USB] Log: "); Serial.println(logFileName);
+          f.println("Timestamp,PotValue,EncoderValue,InternalTemp,ThermocoupleTemp,"
+                    "SetpointTemp,SSR_Esc,SSR_Relay,Step,LearnPhase,Dwelling");
+          f.close();
+        }
+        resumeCore1();
       }
-      resumeCore1();
     } else {
       Serial.println("[USB] FAT32 mount failed — needs FAT32 formatted drive");
       usbFsReady = false;
@@ -870,17 +873,37 @@ void readPicoT() {
 
 // Ask Core 1 to park in a spin loop so Core 0 can drive tuh_task() alone.
 // Core 1 interrupts remain enabled so PIO USB IRQs still queue events.
+// If Core 1 does not respond within 1 s (e.g. USB drive suspended Core 1 in
+// USBHost.task()), mark USB offline and return without having paused Core 1.
+// Callers MUST check core1PauseTimeout and skip file I/O if true.
 void pauseCore1() {
+  core1PauseTimeout = false;
   core1PauseRequest = true;
-  while (!core1PauseAck) { tight_loop_contents(); }
+  unsigned long t0 = millis();
+  while (!core1PauseAck) {
+    if (millis() - t0 > 1000) {
+      core1PauseRequest = false;   // cancel — Core 1 will ignore the request
+      core1PauseTimeout = true;
+      usbFsReady     = false;
+      usbFlashMounted = false;
+      loggingEnabled  = false;
+      inProfileSelect = false;
+      profileFileCount = 0;
+      Serial.println("[USB] Core 1 pause timeout — USB offline");
+      return;
+    }
+    tight_loop_contents();
+  }
 }
 void resumeCore1() {
+  if (core1PauseTimeout) return;  // Core 1 was never paused; nothing to release
   core1PauseRequest = false;
   while (core1PauseAck) { tight_loop_contents(); }
 }
 
 void loadSettings() {
   pauseCore1();
+  if (core1PauseTimeout) return;
   File32 f;
   if (!f.open(&fatfs, "settings.csv", O_RDONLY)) { resumeCore1(); return; }
 
@@ -919,6 +942,7 @@ void loadSettings() {
 
 void saveSettings() {
   pauseCore1();
+  if (core1PauseTimeout) return;
   File32 f;
   if (!f.open(&fatfs, "settings.csv", O_WRITE | O_CREAT | O_TRUNC)) {
     Serial.println("Error saving settings");
@@ -940,6 +964,7 @@ void scanProfiles() {
   profileFileCount = 0;
   if (!usbFsReady) return;
   pauseCore1();
+  if (core1PauseTimeout) return;
   File32 root;
   File32 entry;
   if (root.open(&fatfs, "/", O_RDONLY)) {
@@ -979,6 +1004,7 @@ void scanProfiles() {
 
 void readProfile(const char* filename) {
   pauseCore1();
+  if (core1PauseTimeout) { readProfileEnabled = false; return; }
   free(steps);
   steps = NULL;
   numSteps = 0;
@@ -1057,6 +1083,7 @@ void readProfile(const char* filename) {
 
 void loadLearnedData() {
   pauseCore1();
+  if (core1PauseTimeout) return;
   freeLearned();
 
   File32 f;
@@ -1111,6 +1138,7 @@ void loadLearnedData() {
 
 void saveLearnedData() {
   pauseCore1();
+  if (core1PauseTimeout) return;
   fatfs.remove("learned.csv");
   File32 f;
   if (!f.open(&fatfs, "learned.csv", O_WRITE | O_CREAT | O_TRUNC)) {
@@ -1741,6 +1769,7 @@ void drawMenu(float setpointTemp) {
 
 void logData(float setpointTemp) {
   pauseCore1();
+  if (core1PauseTimeout) return;
   File32 f;
   if (f.open(&fatfs, logFileName, O_WRITE | O_CREAT | O_APPEND)) {
     unsigned long timestamp = millis();
